@@ -310,7 +310,9 @@ def to_print_dirs(watch_dir: Path) -> list[Path]:
     """The to-print folders to retry: ``<watch_dir>/to-print`` first, plus the
     folder shippy/shippy-gui save into (``paths.to_print_dir()``) when it is a
     different one (the watcher watches a custom folder). Both are logged."""
-    own = watch_dir / TO_PRINT_DIR
+    # Compare fully resolved paths on both sides: on Windows one spelling may
+    # use 8.3 short names (C:\Users\RUNNER~1) or a junction and the other not.
+    own = (watch_dir / TO_PRINT_DIR).expanduser().resolve()
     try:
         apps = to_print_dir().expanduser().resolve()
     except Exception as exc:  # pylint: disable=broad-exception-caught

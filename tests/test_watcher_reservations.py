@@ -618,11 +618,29 @@ class AppQueueTests(TempDirTest):
         ):
             with self.assertLogs("ibp_printing.watcher", logging.WARNING):
                 dirs = watcher_main.to_print_dirs(watch)
-        self.assertEqual(dirs, [watch / TO_PRINT_DIR, self.dir / "dl" / TO_PRINT_DIR])
+        self.assertEqual(
+            dirs,
+            [
+                (watch / TO_PRINT_DIR).resolve(),
+                (self.dir / "dl" / TO_PRINT_DIR).resolve(),
+            ],
+        )
         with mock.patch.object(
             watcher_main, "to_print_dir", lambda: watch / TO_PRINT_DIR
         ):
-            self.assertEqual(watcher_main.to_print_dirs(watch), [watch / TO_PRINT_DIR])
+            self.assertEqual(
+                watcher_main.to_print_dirs(watch), [(watch / TO_PRINT_DIR).resolve()]
+            )
+        # The same folder spelled differently (unresolved, ".." segments; on
+        # Windows the temp folder is often an 8.3 short name) is one folder.
+        roundabout = watch / ".." / "custom"
+        with mock.patch.object(
+            watcher_main, "to_print_dir", lambda: watch.resolve() / TO_PRINT_DIR
+        ):
+            self.assertEqual(
+                watcher_main.to_print_dirs(roundabout),
+                [(watch / TO_PRINT_DIR).resolve()],
+            )
 
     def test_duplicate_folders_are_merged(self) -> None:
         watcher, _ = self.make_watcher(to_print_dirs=None)
