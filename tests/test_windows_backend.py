@@ -649,6 +649,52 @@ class PrintImageTests(WindowsBackendTestCase):
         self.assertIn("EndDoc failed after StartDoc", result.history[0])
         self.assertIn("AbortDoc returned without raising", result.history[1])
 
+    def test_failure_stage_table(self):
+        # R1: with AbortDoc returning and the queue confirmed empty, only a
+        # failure before EndPage proves nothing was sent. EndPage/EndDoc may
+        # already have handed data to the printer (print-while-spooling).
+        table = {
+            "StartPage": "definite",
+            "Dib.draw": "definite",
+            "EndPage": "uncertain",
+            "EndDoc": "uncertain",
+        }
+        for stage, expected in table.items():
+            with self.subTest(stage=stage):
+                self.fake.calls = []
+                self.fake.dc_fail = {}
+                self.fake.draw_error = None
+                if stage == "Dib.draw":
+                    self.fake.draw_error = OSError("draw failed")
+                else:
+                    self.fake.dc_fail[stage] = RuntimeError(f"{stage} failed")
+                if expected == "definite":
+                    with self.assertRaises(PrintError):
+                        self.print()
+                else:
+                    result = self.print()
+                    self.assertEqual(result.outcome, JobOutcome.UNCERTAIN)
+                    history = "\n".join(result.history)
+                    self.assertIn("no job with this attempt ID", history)
+                    self.assertIn("may already have sent page data", history)
+                self.assertIn("AbortDoc", self.gdi_calls())
+                self.assertEqual(self.fake.open_handles, 0)
+
+    def test_failure_stage_with_job_in_queue_is_always_uncertain(self):
+        for stage in ("StartPage", "Dib.draw", "EndPage", "EndDoc"):
+            with self.subTest(stage=stage):
+                self.fake.calls = []
+                self.fake.dc_fail = {}
+                self.fake.draw_error = None
+                self.fake.visible_after_start_doc = True
+                self.fake.job_statuses = [0x0004]  # DELETING, never goes away
+                if stage == "Dib.draw":
+                    self.fake.draw_error = OSError("draw failed")
+                else:
+                    self.fake.dc_fail[stage] = RuntimeError(f"{stage} failed")
+                result = self.print()
+                self.assertEqual(result.outcome, JobOutcome.UNCERTAIN)
+
     def test_job_still_in_queue_after_abort_is_uncertain(self):
         self.fake.visible_after_start_doc = True
         self.fake.job_statuses = [0x0004]  # DELETING, and it never goes away

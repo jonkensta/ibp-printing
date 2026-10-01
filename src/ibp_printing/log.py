@@ -223,6 +223,117 @@ def _compact(value: Any) -> str:
     return json.dumps(value, default=repr, ensure_ascii=False)
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """A size-rotating file handler whose rotation can fail without loss.
+
+    Two processes of the same app (say, two shippy windows, or ``shippy
+    diagnose-printer`` next to a running shippy) can still hold one log file
+    open. On Windows the second process's open handle makes renaming the file
+    fail with a sharing violation. The standard handler then drops the record
+    being written, and because it shifts the backups *before* renaming the
+    current file, every failed attempt pushes the history one slot further
+    and deletes the oldest backup.
+
+    This handler instead:
+
+    * renames the current file out of the way first, so the usual failure (the
+      file is open elsewhere) happens before any backup is touched;
+    * undoes every rename it made if a later step fails, and only deletes the
+      oldest backup once the whole rotation has succeeded;
+    * on failure reopens the current file in append mode and keeps writing,
+      notes the failure in the log itself, and does not try to rotate again
+      for ``retry_interval_s`` (so a busy log is not renamed on every record).
+
+    A custom ``namer``/``rotator`` is not supported; backups are plain renames.
+    """
+
+    retry_interval_s = 300.0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._retry_after = 0.0
+        self.clock = time.monotonic
+        self.last_rotation_error: Optional[BaseException] = None
+
+    def shouldRollover(self, record: logging.LogRecord) -> int:
+        if self.clock() < self._retry_after:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None  # type: ignore[assignment]
+        try:
+            if self.backupCount > 0:
+                self._rotate_files()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.last_rotation_error = exc
+            self._retry_after = self.clock() + self.retry_interval_s
+            self.stream = self._open()  # mode "a": keep appending
+            self._note_rotation_failure(exc)
+            return
+        self.last_rotation_error = None
+        self._retry_after = 0.0
+        if not self.delay:
+            self.stream = self._open()
+
+    def _rotate_files(self) -> None:
+        """Shift ``base`` -> ``.1`` -> ... -> ``.N``, all or nothing."""
+        base = self.baseFilename
+        backups = [f"{base}.{index}" for index in range(1, self.backupCount + 1)]
+        stamp = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        holding = f"{base}.rotating-{stamp}"
+        dropping = f"{backups[-1]}.dropping-{stamp}"
+        done: list[tuple[str, str]] = []
+        try:
+            if os.path.exists(base):
+                os.rename(base, holding)
+                done.append((base, holding))
+            if os.path.exists(backups[-1]):
+                os.rename(backups[-1], dropping)
+                done.append((backups[-1], dropping))
+            for index in range(len(backups) - 1, 0, -1):
+                source, target = backups[index - 1], backups[index]
+                if os.path.exists(source):
+                    os.rename(source, target)
+                    done.append((source, target))
+            if os.path.exists(holding):
+                os.rename(holding, backups[0])
+                done.append((holding, backups[0]))
+        except OSError:
+            for source, target in reversed(done):
+                with contextlib.suppress(OSError):
+                    os.rename(target, source)
+            raise
+        if os.path.exists(dropping):
+            with contextlib.suppress(OSError):
+                os.remove(dropping)
+
+    def _note_rotation_failure(self, exc: BaseException) -> None:
+        """Write a WARNING line about ``exc`` straight into this file."""
+        record = logging.LogRecord(
+            f"{LOGGER_NAME}.log",
+            logging.WARNING,
+            __file__,
+            0,
+            "log rotation failed (is another copy of this app running?); "
+            "still appending to the current file, retrying in %d s",
+            (int(self.retry_interval_s),),
+            None,
+        )
+        record.data = {
+            "file": self.baseFilename,
+            "error": describe_exception(exc),
+        }
+        add_context(record)
+        if self.stream is None:
+            return
+        with contextlib.suppress(Exception):
+            self.stream.write(self.format(record) + self.terminator)
+            self.flush()
+
+
 def default_log_dir() -> Path:
     """Per-machine log directory (``%LOCALAPPDATA%\\ibp-printing\\logs`` on Windows)."""
     if sys.platform == "win32":
@@ -251,7 +362,9 @@ def configure_logging(
     ``printer-<app>.jsonl`` (shippy uses ``app="shippy"``, the label watcher
     ``app="watcher"``, ``ibp-print-diag`` ``app="diag"``). Separate processes
     must never share a rotating file: on Windows one process's open handle
-    stops another from rotating it.
+    stops another from rotating it. Two copies of the *same* app can still
+    share a file; ``SafeRotatingFileHandler`` then keeps appending and retries
+    rotation later instead of losing records or backups.
 
     Safe to call more than once; handlers are only added the first time for a
     given directory and app. Records still propagate to the root logger, so a
@@ -276,7 +389,7 @@ def configure_logging(
             (text_name, HumanFormatter()),
             (json_name, JsonFormatter()),
         ):
-            handler = RotatingFileHandler(
+            handler = SafeRotatingFileHandler(
                 log_dir / filename,
                 maxBytes=LOG_MAX_BYTES,
                 backupCount=LOG_BACKUP_COUNT,

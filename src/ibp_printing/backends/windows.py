@@ -111,6 +111,14 @@ def open_printer(printer_name: str) -> Iterator[Any]:
         win32print.ClosePrinter(handle)
 
 
+# GDI stages after StartDoc that run before any page data can reach the
+# printer. A failure here may still be a definite non-submission (if the abort
+# is confirmed). EndPage and EndDoc hand page data to the spooler, which may
+# already be sending it to the printer (print-while-spooling, direct ports), so
+# a failure in either is always UNCERTAIN.
+PRE_TRANSMIT_STAGES = frozenset({"StartPage", "Dib.draw"})
+
+
 class _FailedAfterStartDoc(Exception):
     """A GDI call failed after StartDoc, so a job may exist in the spooler."""
 
@@ -309,9 +317,13 @@ class WindowsPrinterBackend(PrinterBackend):
     ) -> None:
         """Decide whether a post-StartDoc failure definitely submitted nothing.
 
-        Raises PrintError only when AbortDoc returned normally, the failure was
-        not in EndDoc, and the queue holds no job with our attempt ID. Anything
-        else leaves ``result.outcome`` as UNCERTAIN, with the reasons in
+        Raises PrintError only when the failure was in StartPage or Dib.draw
+        (before EndPage could hand page data to the spooler), AbortDoc returned
+        normally, and the queue holds no job with our attempt ID. A failure in
+        EndPage or EndDoc is always UNCERTAIN: with print-while-spooling the
+        page may already be on its way to the printer, and an empty queue only
+        means the job has gone, not that it never printed. Anything uncertain
+        leaves ``result.outcome`` as UNCERTAIN, with the reasons in
         ``result.history``.
         """
         printer_name, job_name = result.printer_name, result.job_name
@@ -341,8 +353,13 @@ class WindowsPrinterBackend(PrinterBackend):
         self.log_queue_state(printer_name, f"after {failure.stage} failure")
         self.log_recent_print_events()
 
+        before_transmit = failure.stage in PRE_TRANSMIT_STAGES
+        if not before_transmit:
+            history.append(
+                f"{failure.stage} may already have sent page data to the printer"
+            )
         definite = (
-            failure.stage != "EndDoc"
+            before_transmit
             and failure.abort_error is None
             and check_error is None
             and job is None

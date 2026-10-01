@@ -152,8 +152,23 @@ class LinuxPrinterBackend(PrinterBackend):
             log_event(logger, logging.ERROR, "lp failed", error=describe_exception(exc))
             raise PrintError(f"Print command failed: {exc}") from exc
         finally:
-            os.remove(path)
+            self._remove_temp_file(path)
         return result
+
+    @staticmethod
+    def _remove_temp_file(path: str) -> None:
+        """Delete the temporary PNG. Never raises: once ``lp`` has run, an
+        exception here would hide whether the job was submitted."""
+        try:
+            os.remove(path)
+        except OSError as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "could not delete the temporary print file",
+                path=path,
+                error=describe_exception(exc),
+            )
 
     @staticmethod
     def _cups_printers() -> Optional[dict[str, dict[str, Any]]]:

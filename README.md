@@ -118,7 +118,7 @@ ibp_printing.get_default_printer()      # OS default queue name, or None
 | `get_default_printer()` | The OS default printer name. |
 | `configure_logging(log_dir=None, *, app="ibp-printing", console=True, level=DEBUG)` | Attach the file handlers for `printer-<app>.log` / `printer-<app>.jsonl`. It's safe to call more than once and returns the log directory. |
 | `default_log_dir()` | Where logs go by default. |
-| `PrintError` | Raised **only** when the job definitely never reached the spooler (no printer, CreateDC/CreatePrinterDC/StartDoc failed, or a later failure where AbortDoc returned and the queue holds no job with our attempt ID). Safe to retry. Subclass of `RuntimeError`. |
+| `PrintError` | Raised **only** when the job definitely never reached the spooler (no printer, CreateDC/CreatePrinterDC/StartDoc failed, or a StartPage/draw failure where AbortDoc returned and the queue holds no job with our attempt ID; an `EndPage`/`EndDoc` failure is never a `PrintError`). Safe to retry. Subclass of `RuntimeError`. |
 | `PrintResult` | `printer_name`, `job_name`, `job_id`, `outcome`, `history`, `elapsed_s`. |
 | `JobOutcome` | See [Outcomes](#outcomes). `.ok` is true when a label most likely came out. |
 | `PrinterCandidate`, `PrintQueue`, `UsbDevice` | Discovery records. `candidate.reasons()` explains each check. |
@@ -140,7 +140,7 @@ means the spooler accepted the job. Tracking shows whether it actually printed.
 | `DELETED` | no | The job was deleted from the queue. |
 | `TIMEOUT` | no | Still queued when tracking gave up. It may still print. |
 | `TRACKING_FAILED` | no | Spooled, but following the job raised. History keeps what was seen. |
-| `UNCERTAIN` | no | A GDI call failed after `StartDoc` and the library could not rule out that part or all of the job reached the printer (`EndDoc` failed, `AbortDoc` raised, the job is still in the queue, or the queue could not be checked). `history` says which. |
+| `UNCERTAIN` | no | A GDI call failed after `StartDoc` and the library could not rule out that part or all of the job reached the printer (`EndPage` or `EndDoc` failed — with print-while-spooling the page may already be on its way even if the queue is empty — `AbortDoc` raised, the job is still in the queue, or the queue could not be checked). `history` says which. |
 
 Every non-ok outcome means "the label may or may not come out": tell the user
 to check the printer before reprinting. Never refund or resend automatically;
@@ -193,7 +193,11 @@ elsewhere). Each application writes its **own** pair of files, named by the
 
 Separate files matter on Windows: a process cannot rotate a log file another
 process holds open, so sharing one rotating file between the watcher and an
-app would stop rotation and lose records.
+app would stop rotation and lose records. Two copies of the *same* app (two
+shippy windows, say) can still share a file; the handler
+(`SafeRotatingFileHandler`) then keeps appending to the current file, writes a
+"log rotation failed" WARNING into it, and retries rotation after 5 minutes. A
+failed rotation never drops a record or disturbs the existing backups.
 
 - `printer-<app>.log`: human-readable lines:
   `time LEVEL [attempt-id] thread logger: message | key=value ...`

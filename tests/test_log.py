@@ -4,15 +4,18 @@ import contextlib
 import io
 import json
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from printing_helpers import reset_logging
 
 from ibp_printing.log import (
     HumanFormatter,
     JsonFormatter,
+    SafeRotatingFileHandler,
     add_context,
     attempt,
     configure_logging,
@@ -212,6 +215,158 @@ class ConfigureLoggingTests(unittest.TestCase):
         handlers = logging.getLogger("ibp_printing").handlers
         self.assertEqual(len(handlers), 3)
         self.assertIn("logging configured", stderr.getvalue())
+
+
+class SafeRotatingFileHandlerTests(unittest.TestCase):
+    """Rotation that fails (a second process holds the file) loses nothing."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.base = self.dir / "printer-shippy.log"
+        self.base.write_text("current-0\n", encoding="utf-8")
+        self.backups = {}
+        for index in (1, 2, 3):
+            path = Path(f"{self.base}.{index}")
+            path.write_text(f"backup-{index}\n", encoding="utf-8")
+            self.backups[index] = f"backup-{index}\n"
+        self.now = 1000.0
+        self.handler = SafeRotatingFileHandler(
+            self.base, maxBytes=200, backupCount=3, encoding="utf-8"
+        )
+        self.handler.clock = lambda: self.now
+        self.handler.setFormatter(HumanFormatter())
+        self.handler.addFilter(add_context)
+        self.addCleanup(self.handler.close)
+        self.logger = logging.getLogger("ibp_printing.test.rotation")
+        self.logger.propagate = False
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.handler)
+        self.addCleanup(self.logger.removeHandler, self.handler)
+        self.real_rename = os.rename
+        self.renames: list[tuple[str, str]] = []
+
+    def fail_rename(self, should_fail):
+        """Patch os.rename in ibp_printing.log to fail when ``should_fail``."""
+
+        def fake(source, target):
+            self.renames.append((str(source), str(target)))
+            if should_fail(str(source), str(target)):
+                raise PermissionError(
+                    13, "The process cannot access the file", str(source)
+                )
+            self.real_rename(source, target)
+
+        patcher = mock.patch("ibp_printing.log.os.rename", side_effect=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def log_lines(self, count, prefix="record"):
+        """Log ``count`` long-ish records; return their messages."""
+        messages = [f"{prefix}-{n:03d} " + "x" * 60 for n in range(count)]
+        for message in messages:
+            self.logger.info(message)
+        return messages
+
+    def all_text(self):
+        """Every log file's content, current file first."""
+        paths = [self.base] + sorted(self.dir.glob("printer-shippy.log.*"))
+        return "".join(path.read_text("utf-8") for path in paths)
+
+    def assert_backups_intact(self):
+        """The pre-existing backups were not moved, changed, or deleted."""
+        for index, content in self.backups.items():
+            self.assertEqual(
+                Path(f"{self.base}.{index}").read_text("utf-8"), content, index
+            )
+
+    def test_sharing_violation_keeps_writing_and_backs_off(self):
+        self.fail_rename(lambda source, target: source == str(self.base))
+        messages = self.log_lines(10)
+
+        text = self.base.read_text("utf-8")
+        self.assertTrue(text.startswith("current-0\n"))
+        for message in messages:
+            self.assertIn(message, text)
+        self.assertIn("log rotation failed", text)
+        self.assertEqual(text.count("log rotation failed"), 1)
+        self.assertIsInstance(self.handler.last_rotation_error, PermissionError)
+        # Only one rotation attempt during the back-off, touching only the base.
+        self.assertEqual(len(self.renames), 1)
+        self.assert_backups_intact()
+        self.assertEqual(
+            sorted(p.name for p in self.dir.iterdir()),
+            [
+                "printer-shippy.log",
+                "printer-shippy.log.1",
+                "printer-shippy.log.2",
+                "printer-shippy.log.3",
+            ],
+        )
+
+    def test_rotation_resumes_after_back_off(self):
+        failing = [True]
+        self.fail_rename(lambda source, target: failing[0] and source == str(self.base))
+        first = self.log_lines(5, "early")
+        before = self.base.read_text("utf-8")
+
+        failing[0] = False
+        self.now += SafeRotatingFileHandler.retry_interval_s + 1
+        later = self.log_lines(1, "later")
+
+        self.assertIsNone(self.handler.last_rotation_error)
+        self.assertEqual(Path(f"{self.base}.1").read_text("utf-8"), before)
+        self.assertEqual(Path(f"{self.base}.2").read_text("utf-8"), "backup-1\n")
+        self.assertEqual(Path(f"{self.base}.3").read_text("utf-8"), "backup-2\n")
+        self.assertIn(later[0], self.base.read_text("utf-8"))
+        for message in first:
+            self.assertIn(message, before)
+        self.assertEqual(len(list(self.dir.iterdir())), 4)
+
+    def test_failure_mid_cascade_rolls_back(self):
+        self.fail_rename(
+            lambda source, target: source == f"{self.base}.1"
+            and target == f"{self.base}.2"
+        )
+        messages = self.log_lines(6)
+
+        self.assert_backups_intact()
+        text = self.base.read_text("utf-8")
+        self.assertTrue(text.startswith("current-0\n"))
+        for message in messages:
+            self.assertIn(message, text)
+        self.assertIn("log rotation failed", text)
+        # No holding/dropping leftovers.
+        self.assertEqual(len(list(self.dir.iterdir())), 4)
+
+    def test_base_implementation_would_lose_history(self):
+        # Documents why the subclass exists: the stdlib handler shifts backups
+        # before renaming the open file, so repeated failures destroy history.
+        plain = logging.handlers.RotatingFileHandler(
+            self.dir / "plain.log", maxBytes=1, backupCount=2, encoding="utf-8"
+        )
+        self.addCleanup(plain.close)
+        for index in (1, 2):
+            Path(f"{self.dir / 'plain.log'}.{index}").write_text(f"b{index}")
+        self.fail_rename(lambda source, target: source == str(self.dir / "plain.log"))
+        with self.assertRaises(PermissionError):
+            plain.doRollover()
+        with self.assertRaises(PermissionError):
+            plain.doRollover()
+        # The oldest backup ("b2") was deleted and nothing replaced ".1".
+        self.assertFalse(Path(f"{self.dir / 'plain.log'}.1").exists())
+        self.assertEqual(Path(f"{self.dir / 'plain.log'}.2").read_text(), "b1")
+
+    def test_configure_logging_uses_it(self):
+        reset_logging()
+        self.addCleanup(reset_logging)
+        configure_logging(self.dir / "logs", console=False)
+        handlers = logging.getLogger("ibp_printing").handlers
+        self.assertTrue(handlers)
+        self.assertTrue(
+            all(isinstance(handler, SafeRotatingFileHandler) for handler in handlers)
+        )
 
 
 class DescribeExceptionTests(unittest.TestCase):
