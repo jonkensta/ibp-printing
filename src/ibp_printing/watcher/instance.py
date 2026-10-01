@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import IO, Optional
 
 from ibp_printing.log import describe_exception, get_logger, log_event
+from ibp_printing.watcher.state import LOCK_FILENAME
 
 logger = get_logger(__name__)
 
-LOCK_FILENAME = "watcher.lock"
+__all__ = ["LOCK_FILENAME", "SingleInstance"]
 
 
 class SingleInstance:

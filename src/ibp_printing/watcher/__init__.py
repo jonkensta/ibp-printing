@@ -1,9 +1,11 @@
-"""Label watcher: print EasyPost labels that volunteers download by hand.
+"""Label watcher: print shipping labels from Downloads and the to-print queue.
 
-When a USB label printer fails, volunteers download the label image from the
-EasyPost website. This app watches the Downloads folder, prints any new label
-on the first available label printer, files it under ``printed/`` or
-``failed/``, and logs every step so printer failures can be diagnosed later.
+shippy and shippy-gui save a label into ``<Downloads>/to-print/`` when they
+cannot print it; the watcher retries that folder whenever a usable printer
+exists. It also prints 4x6 labels downloaded by hand into Downloads. Each label
+ends up in ``printed/``, stays in (or goes to) ``to-print/`` when it definitely
+did not print, or goes to ``check-printer/`` when the printer queue reported a
+problem. Every step is logged so printer failures can be diagnosed later.
 """
 
 from ibp_printing.watcher.config import WatcherConfig, default_config_path, load_config

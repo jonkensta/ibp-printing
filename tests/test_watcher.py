@@ -1,4 +1,8 @@
-"""Tests for the label watcher (detection, stability, filing, config, end to end)."""
+"""Tests for the label watcher (detection, stability, filing, config, end to end).
+
+Recovery behaviour (state file, startup catch-up, shutdown, retries) is tested
+in test_watcher_recovery.py, which reuses the helpers defined here.
+"""
 
 # pylint: disable=missing-function-docstring,protected-access
 
@@ -43,9 +47,11 @@ from ibp_printing.watcher.detect import (
     sha256_file,
     wait_until_stable,
 )
+from ibp_printing.paths import CHECK_PRINTER_DIR, PRINTED_DIR, TO_PRINT_DIR
 from ibp_printing.watcher.instance import SingleInstance
 from ibp_printing.watcher.notify import Notifier
-from ibp_printing.watcher.service import FAILED_DIR, PRINTED_DIR, LabelWatcher
+from ibp_printing.watcher.service import LabelWatcher
+from ibp_printing.watcher.state import StateFile
 
 _LOG_DIR = tempfile.mkdtemp(prefix="ibp-watcher-test-logs-")
 
@@ -76,13 +82,20 @@ class FakeBackend(PrinterBackend):
         outcome: JobOutcome = JobOutcome.COMPLETED,
         raise_error: Optional[str] = None,
         printers: int = 1,
+        raise_exc: Optional[BaseException] = None,
     ) -> None:
         self.outcome = outcome
         self.raise_error = raise_error
+        self.raise_exc = raise_exc
         self.printers = printers
         self.printed: list[dict[str, Any]] = []
+        self.attempts = 0
+        self.discoveries = 0
+        self.gate: Optional[threading.Event] = None
+        self.started = threading.Event()
 
     def discover(self) -> Discovery:
+        self.discoveries += 1
         queues = [PrintQueue(name=f"Fake Label {i}") for i in range(self.printers)]
         return Discovery(
             queues=queues,
@@ -103,8 +116,14 @@ class FakeBackend(PrinterBackend):
         job_name: str,
         track_timeout_s: float = 0.0,
     ) -> PrintResult:
+        self.attempts += 1
+        self.started.set()
+        if self.gate is not None:
+            self.gate.wait(10)
         if self.raise_error:
             raise PrintError(self.raise_error)
+        if self.raise_exc is not None:
+            raise self.raise_exc
         self.printed.append(
             {
                 "printer": printer_name,
@@ -134,15 +153,32 @@ class TempDirTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="ibp-watcher-test-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
+        self.state_dir = Path(tempfile.mkdtemp(prefix="ibp-watcher-state-"))
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
         self.addCleanup(ibp_printing.set_backend, None)
 
-    def make_watcher(self, **overrides: Any) -> tuple[LabelWatcher, RecordingNotifier]:
+    def make_watcher(
+        self, state: Optional[StateFile] = None, **overrides: Any
+    ) -> tuple[LabelWatcher, RecordingNotifier]:
         config = WatcherConfig(stable_seconds=0.05, stable_timeout_s=5.0)
         for key, value in overrides.items():
             setattr(config, key, value)
         notifier = RecordingNotifier()
-        watcher = LabelWatcher(config, self.dir, notifier=notifier)
+        watcher = LabelWatcher(config, self.dir, notifier=notifier, state=state)
         return watcher, notifier
+
+    def state_file(self) -> StateFile:
+        return StateFile(self.state_dir / "watcher-state.json")
+
+    def queue_label(self, name: str, seed: int = 0, age_s: float = 0.0) -> Path:
+        """Put a label into to-print/ the way save_for_retry does."""
+        folder = self.dir / TO_PRINT_DIR
+        folder.mkdir(exist_ok=True)
+        path = make_label(folder / name, seed=seed)
+        if age_s:
+            when = time.time() - age_s
+            os.utime(path, (when, when))
+        return path
 
 
 class DetectionTests(TempDirTest):
@@ -289,6 +325,7 @@ class ConfigTests(TempDirTest):
         self.assertEqual(config.dedupe_seconds, 60)
         self.assertEqual(config.track_timeout_s, 60)
         self.assertEqual(config.heartbeat_minutes, 15)
+        self.assertEqual(config.retry_seconds, 60)
         self.assertTrue(config.notify_on_failure)
 
     def test_load_toml(self) -> None:
@@ -369,18 +406,40 @@ class ProcessingTests(TempDirTest):
         self.assertEqual(backend.printed[0]["track_timeout_s"], 12.0)
         self.assertEqual(notifier.texts, [])
 
-    def test_bad_outcome_moves_to_failed_and_notifies(self) -> None:
-        ibp_printing.set_backend(FakeBackend(outcome=JobOutcome.ERROR))
+    def test_spooled_but_not_ok_goes_to_check_printer(self) -> None:
+        for job_outcome in (
+            JobOutcome.ERROR,
+            JobOutcome.TIMEOUT,
+            JobOutcome.UNCERTAIN,
+            JobOutcome.TRACKING_FAILED,
+        ):
+            with self.subTest(outcome=job_outcome):
+                backend = FakeBackend(outcome=job_outcome)
+                ibp_printing.set_backend(backend)
+                watcher, notifier = self.make_watcher()
+                outcome = watcher.process_path(
+                    make_label(self.dir / "label.png", seed=hash(job_outcome) % 99)
+                )
+                self.assertEqual(outcome.status, "check_printer")
+                assert outcome.moved_to is not None
+                self.assertEqual(outcome.moved_to.parent, self.dir / CHECK_PRINTER_DIR)
+                self.assertEqual(len(notifier.texts), 1)
+                self.assertIn("may NOT have printed", notifier.texts[0])
+                self.assertIn("BEFORE printing it again", notifier.texts[0])
+                self.assertIn(str(outcome.moved_to), notifier.texts[0])
+                self.assertIn(job_outcome.value, outcome.detail)
+                self.assertFalse((self.dir / TO_PRINT_DIR).exists())
+
+    def test_unexpected_print_exception_is_uncertain(self) -> None:
+        ibp_printing.set_backend(FakeBackend(raise_exc=OSError("boom")))
         watcher, notifier = self.make_watcher()
         outcome = watcher.process_path(make_label(self.dir / "label.png"))
-        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.status, "check_printer")
         assert outcome.moved_to is not None
-        self.assertEqual(outcome.moved_to.parent, self.dir / FAILED_DIR)
+        self.assertEqual(outcome.moved_to.parent.name, CHECK_PRINTER_DIR)
         self.assertEqual(len(notifier.texts), 1)
-        self.assertIn("may NOT have printed", notifier.texts[0])
-        self.assertIn(str(outcome.moved_to), notifier.texts[0])
 
-    def test_print_error_and_no_printer(self) -> None:
+    def test_print_error_and_no_printer_go_to_to_print(self) -> None:
         for backend in (
             FakeBackend(raise_error="spool failed"),
             FakeBackend(printers=0),
@@ -388,10 +447,28 @@ class ProcessingTests(TempDirTest):
             ibp_printing.set_backend(backend)
             watcher, notifier = self.make_watcher()
             outcome = watcher.process_path(make_label(self.dir / "label.png"))
-            self.assertEqual(outcome.status, "failed")
+            self.assertEqual(outcome.status, "to_print")
             assert outcome.moved_to is not None
-            self.assertEqual(outcome.moved_to.parent.name, FAILED_DIR)
+            self.assertEqual(outcome.moved_to.parent.name, TO_PRINT_DIR)
             self.assertEqual(len(notifier.texts), 1)
+            self.assertIn("did NOT print", notifier.texts[0])
+            self.assertIn("print automatically", notifier.texts[0])
+            self.assertIn(str(outcome.moved_to), notifier.texts[0])
+
+    def test_print_error_when_move_fails_tells_volunteer(self) -> None:
+        ibp_printing.set_backend(FakeBackend(printers=0))
+        watcher, notifier = self.make_watcher()
+        watcher._sleep = lambda seconds: None
+        path = make_label(self.dir / "label.png")
+        with mock.patch(
+            "ibp_printing.watcher.core.os.rename",
+            side_effect=PermissionError(13, "in use"),
+        ):
+            outcome = watcher.process_path(path)
+        self.assertEqual(outcome.status, "to_print")
+        self.assertIsNone(outcome.moved_to)
+        self.assertIn("could not be moved", notifier.texts[0])
+        self.assertIn(str(self.dir / TO_PRINT_DIR), notifier.texts[0])
 
     def test_notify_disabled(self) -> None:
         ibp_printing.set_backend(FakeBackend(printers=0))
@@ -399,15 +476,20 @@ class ProcessingTests(TempDirTest):
         watcher.process_path(make_label(self.dir / "label.png"))
         self.assertEqual(notifier.texts, [])
 
-    def test_failed_print_can_be_retried(self) -> None:
+    def test_failed_print_is_retried_from_to_print(self) -> None:
         backend = FakeBackend(printers=0)
         ibp_printing.set_backend(backend)
         watcher, _ = self.make_watcher()
         first = watcher.process_path(make_label(self.dir / "label.png"))
-        self.assertEqual(first.status, "failed")
+        self.assertEqual(first.status, "to_print")
+        self.assertEqual(watcher.retry_queue_once("test"), [])  # still no printer
         backend.printers = 1
-        second = watcher.process_path(make_label(self.dir / "label (1).png"))
-        self.assertEqual(second.status, "printed")
+        outcomes = watcher.retry_queue_once("test")
+        self.assertEqual([o.status for o in outcomes], ["printed"])
+        assert outcomes[0].moved_to is not None
+        self.assertEqual(outcomes[0].moved_to.parent.name, PRINTED_DIR)
+        self.assertEqual(list((self.dir / TO_PRINT_DIR).iterdir()), [])
+        self.assertTrue(backend.printed[0]["job_name"].startswith("Queued "))
 
     def test_content_dedupe(self) -> None:
         backend = FakeBackend()
@@ -420,13 +502,21 @@ class ProcessingTests(TempDirTest):
         make_label(self.dir / "label.png")
         shutil.copy(self.dir / "label.png", self.dir / "label (1).png")
         self.assertEqual(watcher.process_path(self.dir / "label.png").status, "printed")
-        dup = watcher.process_path(self.dir / "label (1).png")
+        with self.assertLogs("ibp_printing.watcher", logging.WARNING) as logs:
+            dup = watcher.process_path(self.dir / "label (1).png")
         self.assertEqual(dup.status, "duplicate")
+        self.assertTrue(any("DUPLICATE not printed" in line for line in logs.output))
+        self.assertTrue(any("rename the file" in line for line in logs.output))
         self.assertTrue((self.dir / "label (1).png").exists())
         self.assertEqual(len(backend.printed), 1)
         clock.now += 61
-        again = watcher.process_path(self.dir / "label (1).png")
-        self.assertEqual(again.status, "printed")
+        # The unchanged duplicate is not re-decided by a stray event...
+        self.assertEqual(
+            watcher.process_path(self.dir / "label (1).png").status, "unchanged"
+        )
+        # ...but renaming it after the window prints it (a deliberate reprint).
+        renamed = (self.dir / "label (1).png").rename(self.dir / "label again.png")
+        self.assertEqual(watcher.process_path(renamed).status, "printed")
         self.assertEqual(len(backend.printed), 2)
 
     def test_dry_run_prints_and_moves_nothing(self) -> None:
@@ -489,7 +579,7 @@ class ProcessingTests(TempDirTest):
         watcher._sleep = lambda seconds: None
         path = make_label(self.dir / "label.png")
         with mock.patch(
-            "ibp_printing.watcher.service.os.rename",
+            "ibp_printing.watcher.core.os.rename",
             side_effect=PermissionError(13, "in use"),
         ) as rename:
             outcome = watcher.process_path(path)
@@ -515,7 +605,7 @@ class ProcessingTests(TempDirTest):
                 raise PermissionError(13, "in use")
             real_rename(src, dst)
 
-        with mock.patch("ibp_printing.watcher.service.os.rename", side_effect=flaky):
+        with mock.patch("ibp_printing.watcher.core.os.rename", side_effect=flaky):
             outcome = watcher.process_path(make_label(self.dir / "label.png"))
         assert outcome.moved_to is not None
         self.assertTrue(outcome.moved_to.exists())
@@ -588,6 +678,12 @@ class InstanceTests(TempDirTest):
         again.release()
 
 
+def quiet_configure(log_dir: Optional[Path] = None, **kwargs: Any) -> Path:
+    """configure_logging without the console handler (keeps test output clean)."""
+    assert kwargs.get("app") == "watcher", kwargs
+    return configure_logging(log_dir, app="watcher", console=False)
+
+
 class EndToEndTests(TempDirTest):
     """Tests for EndToEnd."""
 
@@ -628,12 +724,14 @@ class EndToEndTests(TempDirTest):
         watch = self.dir / "downloads"
         watch.mkdir()
         label = make_label(watch / "label.png")
-        real_configure = watcher_main.configure_logging
+        (watch / TO_PRINT_DIR).mkdir()
+        queued = make_label(watch / TO_PRINT_DIR / "x.png", seed=5)
+        state = self.dir / "state"
 
-        def quiet(log_dir: Optional[Path] = None, **_: Any) -> Path:
-            return real_configure(log_dir, console=False)
-
-        with mock.patch.object(watcher_main, "configure_logging", quiet):
+        with (
+            mock.patch.object(watcher_main, "configure_logging", quiet_configure),
+            mock.patch.object(watcher_main, "default_state_dir", lambda: state),
+        ):
             code = watcher_main.main(
                 [
                     "--config",
@@ -648,30 +746,36 @@ class EndToEndTests(TempDirTest):
             )
         self.assertEqual(code, 0)
         self.assertTrue(label.exists())
+        self.assertTrue(queued.exists())
         self.assertEqual(backend.printed, [])
         for handler in logging.getLogger("ibp_printing").handlers:
             handler.flush()
-        text = (logs / "printer.log").read_text(encoding="utf-8")
+        text = (logs / "printer-watcher.log").read_text(encoding="utf-8")
         self.assertIn("DRY RUN: would print", text)
+        self.assertIn("x.png", text)  # the to-print queue is handled too
         self.assertIn("effective config", text)
-        self.assertTrue((self.dir / "state" / "watcher.lock").exists())
+        self.assertTrue((state / "watcher.lock").exists())
+        self.assertFalse((state / "watcher-state.json").exists())  # dry run
+        self.assertFalse((self.dir / "state" / "logs" / "watcher.lock").exists())
 
-    def test_main_refuses_second_instance(self) -> None:
-        logs = self.dir / "logs"
-        logs.mkdir()
-        holder = SingleInstance(self.dir / "watcher.lock")
+    def test_main_refuses_second_instance_whatever_the_log_dir(self) -> None:
+        state = self.dir / "state"
+        holder = SingleInstance(state / "watcher.lock")
         self.assertTrue(holder.acquire())
         self.addCleanup(holder.release)
-        real_configure = watcher_main.configure_logging
-
-        def quiet(log_dir: Optional[Path] = None, **_: Any) -> Path:
-            return real_configure(log_dir, console=False)
-
-        with mock.patch.object(watcher_main, "configure_logging", quiet):
-            code = watcher_main.main(
-                ["--config", str(self.dir / "none.toml"), "--log-dir", str(logs)]
-            )
-        self.assertEqual(code, watcher_main.EXIT_ALREADY_RUNNING)
+        configure = mock.Mock(side_effect=quiet_configure)
+        for logs in (self.dir / "logs-a", self.dir / "logs-b"):
+            with (
+                mock.patch.object(watcher_main, "configure_logging", configure),
+                mock.patch.object(watcher_main, "default_state_dir", lambda: state),
+                mock.patch.object(watcher_main, "_has_console", lambda: False),
+            ):
+                code = watcher_main.main(
+                    ["--config", str(self.dir / "none.toml"), "--log-dir", str(logs)]
+                )
+            self.assertEqual(code, watcher_main.EXIT_ALREADY_RUNNING)
+            self.assertFalse(logs.exists())  # lock taken before logging opens files
+        configure.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 """Decide whether a downloaded file is a 4x6 shipping label, and load it."""
 
+import errno
 import fnmatch
 import hashlib
+import io
 import logging
 import time
 from dataclasses import dataclass, field
@@ -24,6 +26,15 @@ IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp"})
 PDF_SUFFIXES = frozenset({".pdf"})
 
 
+# Siblings that mean "the browser is still writing this download". Firefox
+# creates an empty final file plus ``<name>.part`` and renames the .part over it
+# when done; newer Chrome/Edge use ``<name>.crdownload``.
+IN_PROGRESS_SIBLING_SUFFIXES = (".part", ".crdownload", ".download", ".opdownload")
+# Windows sharing/lock violations: another program has the file open.
+_TRANSIENT_WINERRORS = frozenset({5, 32, 33})
+_TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EBUSY, errno.EAGAIN, errno.EPERM})
+
+
 def is_temp_name(path: Path) -> bool:
     """True for in-progress browser downloads and hidden/lock files."""
     name = path.name
@@ -38,6 +49,28 @@ def matches_globs(path: Path, globs: Iterable[str]) -> Optional[str]:
     for pattern in globs:
         if fnmatch.fnmatchcase(name, pattern.lower()):
             return pattern
+    return None
+
+
+def download_in_progress(path: Path) -> Optional[str]:
+    """Why ``path`` looks like a download that has not finished, or None.
+
+    A 0-byte file, or one with a ``<name>.part``/``.crdownload`` sibling, is a
+    placeholder: the browser will rename the real data over it, which fires a
+    fresh event. Waiting for it here would only block the worker.
+    """
+    for suffix in IN_PROGRESS_SIBLING_SUFFIXES:
+        sibling = path.with_name(path.name + suffix)
+        try:
+            if sibling.exists():
+                return f"download still in progress ({sibling.name} exists)"
+        except OSError:
+            continue
+    try:
+        if path.stat().st_size == 0:
+            return "file is empty (download placeholder?)"
+    except OSError:
+        return None
     return None
 
 
@@ -60,11 +93,13 @@ def wait_until_stable(  # pylint: disable=too-many-locals
     interval_s: float = 0.25,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> Stability:
     """Wait until ``path`` keeps the same size for ``stable_s`` and can be opened.
 
     Browsers sometimes keep writing (or keep a lock) briefly after the final
-    rename, and antivirus scanners open new files too.
+    rename, and antivirus scanners open new files too. ``cancel`` is polled
+    between checks so shutdown never waits out the full timeout.
     """
     started = clock()
     last_size: Optional[int] = None
@@ -104,6 +139,8 @@ def wait_until_stable(  # pylint: disable=too-many-locals
             else:
                 return Stability(True, size, now - started, checks)
 
+        if cancel is not None and cancel():
+            return Stability(False, last_size or -1, now - started, checks, "cancelled")
         if now - started >= timeout_s:
             reason = last_problem or (
                 "file is empty" if last_size == 0 else "size kept changing"
@@ -121,8 +158,80 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    """Hex SHA-256 of some bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
 class UnsupportedFormat(Exception):
     """The file cannot be turned into an image we can print."""
+
+
+class TransientReadError(Exception):
+    """The file exists but could not be read right now (locked, in use)."""
+
+
+def is_transient_os_error(exc: OSError) -> bool:
+    """True for errors that usually clear up: sharing violations, EBUSY, ..."""
+    if isinstance(exc, FileNotFoundError):
+        return False
+    if isinstance(exc, PermissionError):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    if winerror in _TRANSIENT_WINERRORS:
+        return True
+    return exc.errno in _TRANSIENT_ERRNOS
+
+
+def read_file_bytes(
+    path: Path,
+    *,
+    attempts: int = 3,
+    delay_s: float = 0.5,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bytes:
+    """Read the whole file, retrying briefly while another program holds it.
+
+    Reading once and decoding from memory keeps "could not read the file"
+    (usually temporary: antivirus, a sharing violation) apart from "the content
+    is not an image" (permanent for that content).
+
+    Raises:
+        FileNotFoundError: the file is gone.
+        TransientReadError: still unreadable after ``attempts`` tries.
+    """
+    last: Optional[OSError] = None
+    for attempt_no in range(1, attempts + 1):
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            last = exc
+            log_event(
+                logger,
+                logging.WARNING,
+                "file read failed",
+                file=path.name,
+                attempt=attempt_no,
+                of=attempts,
+                transient=is_transient_os_error(exc),
+                error=describe_exception(exc),
+            )
+            if attempt_no < attempts:
+                sleep(delay_s * attempt_no)
+    raise TransientReadError(f"could not read {path.name}: {last!r}") from last
+
+
+def peek_size(path: Path) -> Optional[tuple[int, int]]:
+    """Image size from the header only (cheap); None for PDFs or on any error."""
+    if path.suffix.lower() not in IMAGE_SUFFIXES:
+        return None
+    try:
+        with Image.open(path) as opened:
+            return opened.size
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
 
 
 @dataclass
@@ -134,7 +243,7 @@ class LoadedLabel:
     info: dict[str, Any] = field(default_factory=dict)
 
 
-def _load_pdf(path: Path, dpi: int) -> LoadedLabel:
+def _load_pdf(path: Path, data: bytes, dpi: int) -> LoadedLabel:
     try:
         import pypdfium2  # pylint: disable=import-outside-toplevel
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -146,7 +255,7 @@ def _load_pdf(path: Path, dpi: int) -> LoadedLabel:
         )
         raise UnsupportedFormat(f"PDF support unavailable: {exc!r}") from exc
 
-    pdf = pypdfium2.PdfDocument(str(path))
+    pdf = pypdfium2.PdfDocument(data)
     try:
         page_count = len(pdf)
         if page_count == 0:
@@ -175,25 +284,36 @@ def _load_pdf(path: Path, dpi: int) -> LoadedLabel:
         pdf.close()
 
 
-def load_label(path: Path, *, pdf_dpi: int = 300) -> LoadedLabel:
+def load_label(
+    path: Path, *, pdf_dpi: int = 300, data: Optional[bytes] = None
+) -> LoadedLabel:
     """Decode an image or the first page of a PDF.
 
+    Args:
+        data: The file's bytes, if already read (see ``read_file_bytes``).
+
     Raises:
-        UnsupportedFormat: for raw printer languages, unknown types, or files
-            that fail to decode.
+        UnsupportedFormat: for raw printer languages, unknown types, or content
+            that fails to decode.
+        TransientReadError: if ``data`` is None and the file cannot be read.
     """
     suffix = path.suffix.lower()
     if suffix in RAW_PRINTER_SUFFIXES:
         raise UnsupportedFormat(f"raw printer language {suffix} is not supported")
+    if data is None:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise TransientReadError(f"could not read {path.name}: {exc!r}") from exc
     if suffix in PDF_SUFFIXES:
         try:
-            return _load_pdf(path, pdf_dpi)
+            return _load_pdf(path, data, pdf_dpi)
         except UnsupportedFormat:
             raise
         except Exception as exc:  # pylint: disable=broad-exception-caught
             raise UnsupportedFormat(f"PDF failed to render: {exc!r}") from exc
     try:
-        with Image.open(path) as opened:
+        with Image.open(io.BytesIO(data)) as opened:
             opened.load()
             fmt = opened.format or suffix.lstrip(".").upper()
             info = {

@@ -20,11 +20,17 @@ from ibp_printing.log import (
     install_exception_hooks,
     log_event,
 )
+from ibp_printing.paths import downloads_dir
 from ibp_printing.watcher.config import WatcherConfig, load_config
-from ibp_printing.watcher.folders import downloads_dir
-from ibp_printing.watcher.instance import LOCK_FILENAME, SingleInstance
+from ibp_printing.watcher.instance import SingleInstance
 from ibp_printing.watcher.notify import MB_ICONERROR, MB_SETFOREGROUND, message_box
 from ibp_printing.watcher.service import LabelWatcher
+from ibp_printing.watcher.state import (
+    LOCK_FILENAME,
+    STATE_FILENAME,
+    StateFile,
+    default_state_dir,
+)
 
 logger = get_logger("watcher")
 
@@ -44,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, help="path to watcher.toml")
     parser.add_argument("--watch-dir", type=Path, help="folder to watch")
-    parser.add_argument("--log-dir", type=Path, help="folder for printer.log/.jsonl")
+    parser.add_argument(
+        "--log-dir", type=Path, help="folder for printer-watcher.log/.jsonl"
+    )
     parser.add_argument(
         "--process-existing",
         action="store_true",
@@ -145,39 +153,27 @@ def _log_startup(watcher: LabelWatcher) -> None:
         logger, logging.INFO, "PrintService events, last 60 min", count=len(events)
     )
     for event in events:
-        log_event(logger, logging.INFO, "PrintService event", **event)
+        log_event(logger, logging.INFO, "PrintService event", event=event)
 
 
 def run(argv: Optional[Sequence[str]] = None) -> int:
-    """Parse arguments, set everything up, and run until stopped."""
+    """Parse arguments, take the lock, set up logging, and run until stopped."""
     args = build_parser().parse_args(argv)
     config, config_path, warnings = load_config(args.config)
     overrides = apply_overrides(config, args)
 
-    log_dir = configure_logging(config.log_dir, console=True)
-    if args.verbose:
-        for handler in logging.getLogger("ibp_printing").handlers:
-            # File handlers subclass StreamHandler; only the console one changes.
-            if type(handler) is logging.StreamHandler:  # pylint: disable=C0123
-                handler.setLevel(logging.DEBUG)
-    install_exception_hooks()
-
-    log_event(
-        logger,
-        logging.INFO,
-        "label watcher starting",
-        version=_version(),
-        argv=sys.argv,
-        config_file=str(config_path),
-        config_file_exists=config_path.exists(),
-        cli_overrides=overrides,
-        console=_has_console(),
-    )
-    for warning in warnings:
-        log_event(logger, logging.WARNING, "config warning", warning=warning)
-
-    instance = SingleInstance(log_dir.parent / LOCK_FILENAME)
+    # The lock lives at a fixed per-user place (not under --log-dir), and is
+    # taken before logging opens any file, so a second copy never touches the
+    # running watcher's rotating log files.
+    state_dir = default_state_dir()
+    instance = SingleInstance(state_dir / LOCK_FILENAME)
     if not instance.acquire():
+        if _has_console():
+            print(
+                "ibp-label-watcher: another label watcher is already running "
+                f"(lock {instance.lock_path}); exiting.",
+                file=sys.stderr,
+            )
         _fatal_box(
             "The IBP label watcher is already running.\n\n"
             "Only one copy can run at a time."
@@ -185,12 +181,37 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_ALREADY_RUNNING
 
     try:
-        return _run_locked(config, args)
+        configure_logging(config.log_dir, app="watcher", console=True)
+        if args.verbose:
+            for handler in logging.getLogger("ibp_printing").handlers:
+                # File handlers subclass StreamHandler; only the console one changes.
+                if type(handler) is logging.StreamHandler:  # pylint: disable=C0123
+                    handler.setLevel(logging.DEBUG)
+        install_exception_hooks()
+
+        log_event(
+            logger,
+            logging.INFO,
+            "label watcher starting",
+            version=_version(),
+            argv=sys.argv,
+            config_file=str(config_path),
+            config_file_exists=config_path.exists(),
+            cli_overrides=overrides,
+            console=_has_console(),
+            lock=str(instance.lock_path),
+            state_dir=str(state_dir),
+        )
+        for warning in warnings:
+            log_event(logger, logging.WARNING, "config warning", warning=warning)
+        return _run_locked(config, args, state_dir)
     finally:
         instance.release()
 
 
-def _run_locked(config: WatcherConfig, args: argparse.Namespace) -> int:
+def _run_locked(
+    config: WatcherConfig, args: argparse.Namespace, state_dir: Path
+) -> int:
     watch_dir = Path(config.watch_dir) if config.watch_dir else downloads_dir()
     watch_dir = watch_dir.expanduser().resolve()
     config.watch_dir = watch_dir
@@ -206,8 +227,20 @@ def _run_locked(config: WatcherConfig, args: argparse.Namespace) -> int:
         _fatal_box(f"The label watcher cannot find the folder:\n{watch_dir}")
         return EXIT_BAD_WATCH_DIR
 
+    # A dry run or --once must not move the "seen up to" mark: files it only
+    # pretended to print would then be skipped by the next real run.
+    state: Optional[StateFile] = None
+    if args.once or config.dry_run:
+        log_event(
+            logger,
+            logging.INFO,
+            "state file not used (dry run or --once): files already in the "
+            "folder are handled as on a first run",
+        )
+    else:
+        state = StateFile(state_dir / STATE_FILENAME)
     stop = threading.Event()
-    watcher = LabelWatcher(config, watch_dir, stop_event=stop)
+    watcher = LabelWatcher(config, watch_dir, stop_event=stop, state=state)
     _log_startup(watcher)
 
     if args.once:

@@ -27,8 +27,11 @@ class WatcherConfig:  # pylint: disable=too-many-instance-attributes
     aspect_min: float = 1.4
     aspect_max: float = 1.6
     min_short_side_px: int = 400
-    # Identical content printed this recently is not printed again.
+    # Identical content sent to a printer this recently is not sent again.
     dedupe_seconds: float = 60.0
+    # How often to retry labels waiting in <watch_dir>/to-print/ (and re-check
+    # downloads that were temporarily locked).
+    retry_seconds: float = 60.0
     # How long to follow the spooled job before giving up.
     track_timeout_s: float = 60.0
     notify_on_failure: bool = True
