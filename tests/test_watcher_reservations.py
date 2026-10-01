@@ -208,6 +208,16 @@ class UncertainTests(Restartable):
         )
         self.assertEqual(self.saved()[digest].status, "printed")
 
+        # Once the printer works again, the queued REPRINT is still printed.
+        backend.raise_error = None
+        queued = list((self.dir / "to-print").glob("*.png"))
+        self.assertEqual(len(queued), 1)
+        self.assertTrue(queued[0].name.startswith("REPRINT_"))
+        attempts = backend.attempts
+        outcomes = watcher.retry_queue_once("printer back")
+        self.assertEqual([o.status for o in outcomes], ["printed"])
+        self.assertEqual(backend.attempts, attempts + 1)
+
     def test_crash_mid_print_of_queued_label_and_its_copy(self) -> None:
         backend = FakeBackend()
         ibp_printing.set_backend(backend)

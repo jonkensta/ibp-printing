@@ -923,6 +923,10 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
         """
         target_dir = self._results_base(path) / subdir
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # Keep a deliberate reprint recognisable after the timestamp is added,
+        # so a failed REPRINT that lands in to-print/ is still printed later.
+        if is_reprint(path):
+            prefix = f"{REPRINT_PREFIX}_{prefix}"
         last_exc: Optional[BaseException] = None
         for attempt_no in range(1, MOVE_RETRIES + 1):
             try:
