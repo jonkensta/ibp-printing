@@ -1,0 +1,61 @@
+[project]
+name = "ibp-printing"
+version = "0.1.0"
+description = "Shared USB label-printer discovery, printing, and diagnostics for IBP shipping tools"
+readme = "README.md"
+authors = [
+    { name = "Jonathan Starr", email = "github@jstarr.me" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=12.2.0",
+    "pywin32>=310; sys_platform == 'win32'",
+    "WMI>=1.5.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+linux = [
+    "pycups>=2.0.4",
+]
+watcher = [
+    "watchdog>=6.0.0",
+    "pypdfium2>=4.30.0",
+]
+
+[project.scripts]
+ibp-print-diag = "ibp_printing.diagnostics:main"
+ibp-label-watcher = "ibp_printing.watcher.__main__:main"
+
+[project.gui-scripts]
+ibp-label-watcherw = "ibp_printing.watcher.__main__:main"
+
+[dependency-groups]
+dev = [
+    "ibp-printing[watcher]",
+    "black>=26.3.1",
+    "mypy>=1.16.1",
+    "pylint>=3.3.7",
+    "types-pywin32>=310.0.0.20250516",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.pylint.main]
+py-version = "3.12"
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint.design]
+max-attributes = 12
+max-args = 7
+max-positional-arguments = 7
+
+[tool.mypy]
+ignore_missing_imports = true

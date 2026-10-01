@@ -1,0 +1,41 @@
+"""Shared USB label-printer discovery, printing, and diagnostics for IBP."""
+
+from ibp_printing.api import (
+    discover,
+    find_label_printers,
+    get_backend,
+    get_default_printer,
+    print_image,
+    print_to_first_available,
+    set_backend,
+)
+from ibp_printing.backends import PrinterBackend, PrintError
+from ibp_printing.log import configure_logging, default_log_dir
+from ibp_printing.models import (
+    Discovery,
+    JobOutcome,
+    PrinterCandidate,
+    PrintQueue,
+    PrintResult,
+    UsbDevice,
+)
+
+__all__ = [
+    "Discovery",
+    "JobOutcome",
+    "PrintError",
+    "PrintQueue",
+    "PrintResult",
+    "PrinterBackend",
+    "PrinterCandidate",
+    "UsbDevice",
+    "configure_logging",
+    "default_log_dir",
+    "discover",
+    "find_label_printers",
+    "get_backend",
+    "get_default_printer",
+    "print_image",
+    "print_to_first_available",
+    "set_backend",
+]
