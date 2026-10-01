@@ -1,6 +1,6 @@
 [project]
 name = "ibp-printing"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared USB label-printer discovery, printing, and diagnostics for IBP shipping tools"
 readme = "README.md"
 authors = [
