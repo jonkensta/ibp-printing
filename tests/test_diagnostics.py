@@ -93,7 +93,7 @@ class BuildReportTests(unittest.TestCase):
             f"1. {GOOD}",
             "id=372 level=2: The document Label failed to print.",
             "Operational: unavailable: disabled",
-            "/x/logs",
+            str(Path("/x/logs")),
         ):
             with self.subTest(text=text):
                 self.assertIn(text, report)
@@ -199,10 +199,12 @@ class MainTests(unittest.TestCase):
 
     def setUp(self):
         reset_logging()
-        self.addCleanup(reset_logging)
-        quiet_logging(self)
         tmp = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         self.addCleanup(tmp.cleanup)
+        # Cleanups run last-in first-out: close the log files before the folder
+        # is deleted (Windows cannot delete files that are still open).
+        self.addCleanup(reset_logging)
+        quiet_logging(self)
         self.log_dir = Path(tmp.name)
         self.backend = FakeBackend(
             [PrintQueue(GOOD), PrintQueue(OFFICE)], [dymo()], events=list(EVENTS)

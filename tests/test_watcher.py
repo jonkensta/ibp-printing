@@ -56,9 +56,29 @@ from ibp_printing.watcher.state import StateFile
 
 _LOG_DIR = tempfile.mkdtemp(prefix="ibp-watcher-test-logs-")
 
+# Texts of every message box the code under test tried to show. On Windows the
+# real MessageBoxW would block forever on a headless machine, so tests never
+# let it run (see setUpModule).
+SHOWN_BOXES: list[str] = []
+
+
+def fake_message_box(text: str, title: str = notify.TITLE, flags: int = 0) -> int:
+    """Stands in for notify.message_box: records the text, shows nothing."""
+    del title, flags
+    SHOWN_BOXES.append(text)
+    return 1  # IDOK
+
 
 def setUpModule() -> None:  # pylint: disable=invalid-name
+    """Log to a temp folder and replace every real message box with a fake.
+
+    test_watcher_recovery and test_watcher_reservations call this too.
+    """
     configure_logging(Path(_LOG_DIR), console=False)
+    for target in (notify, watcher_main):
+        patcher = mock.patch.object(target, "message_box", fake_message_box)
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
 
 
 def tearDownModule() -> None:  # pylint: disable=invalid-name
@@ -816,6 +836,25 @@ class EndToEndTests(TempDirTest):
             self.assertEqual(code, watcher_main.EXIT_ALREADY_RUNNING)
             self.assertFalse(logs.exists())  # lock taken before logging opens files
         configure.assert_not_called()
+
+    def test_no_console_refusal_shows_a_box_only_on_windows(self) -> None:
+        state = self.dir / "state"
+        holder = SingleInstance(state / "watcher.lock")
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
+        del SHOWN_BOXES[:]
+        with (
+            mock.patch.object(watcher_main, "configure_logging", quiet_configure),
+            mock.patch.object(watcher_main, "default_state_dir", lambda: state),
+            mock.patch.object(watcher_main, "_has_console", lambda: False),
+        ):
+            code = watcher_main.main(["--config", str(self.dir / "none.toml")])
+        self.assertEqual(code, watcher_main.EXIT_ALREADY_RUNNING)
+        if sys.platform == "win32":
+            self.assertEqual(len(SHOWN_BOXES), 1, SHOWN_BOXES)
+            self.assertIn("already running", SHOWN_BOXES[0])
+        else:
+            self.assertEqual(SHOWN_BOXES, [])
 
 
 if __name__ == "__main__":

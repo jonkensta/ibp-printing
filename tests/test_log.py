@@ -147,9 +147,11 @@ class ConfigureLoggingTests(unittest.TestCase):
 
     def setUp(self):
         reset_logging()
-        self.addCleanup(reset_logging)
         tmp = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         self.addCleanup(tmp.cleanup)
+        # Cleanups run last-in first-out: close the log files before the folder
+        # is deleted (Windows cannot delete files that are still open).
+        self.addCleanup(reset_logging)
         self.log_dir = Path(tmp.name) / "nested" / "logs"
 
     def test_creates_files_and_is_idempotent(self):
