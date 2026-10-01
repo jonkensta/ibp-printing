@@ -4,12 +4,10 @@ import logging
 from pathlib import Path
 
 from ibp_printing.log import attempt, get_logger, log_event
-from ibp_printing.paths import (
-    CHECK_PRINTER_DIR,
-    PARTIAL_SUFFIX,
-)
+from ibp_printing.paths import PARTIAL_SUFFIX
 from ibp_printing.watcher import messages
 from ibp_printing.watcher.core import (
+    MAX_DEFERRED_RETRIES,
     FileOutcome,
     Submission,
     WatcherCore,
@@ -25,21 +23,29 @@ logger = get_logger(__name__)
 
 
 class ToPrintQueue(WatcherCore):
-    """Retries labels waiting in ``<watch_dir>/to-print/``.
+    """Retries labels waiting in the to-print folders.
 
-    shippy and shippy-gui save a label there when no printer could take it, and
-    the watcher moves its own definite failures there. Every ``retry_seconds``
-    the worker checks the folder and, if discovery finds a usable printer,
-    prints the files oldest first.
+    ``<watch_dir>/to-print/`` and, when different, ``paths.to_print_dir()``
+    (where shippy and shippy-gui save a label no printer could take). The
+    watcher moves its own definite failures into the first. Every
+    ``retry_seconds`` the worker checks the folders and, if discovery finds a
+    usable printer, prints the files oldest first.
     """
 
     def queued_files(self) -> list[Path]:
-        """Files waiting in to-print/, oldest first (half-written ones skipped)."""
-        folder = self.to_print_dir
-        if not folder.is_dir():
-            return []
+        """Files waiting in the to-print folders, oldest first (half-written ones
+        skipped)."""
+        found = []
+        for folder in self.to_print_dirs:
+            try:
+                if not folder.is_dir():
+                    continue
+            except OSError:
+                continue
+            found.extend(self.existing_files(folder))
+        found.sort(key=lambda p: (file_signature(p) or (0, 0))[1])
         files = []
-        for path in self.existing_files(folder):
+        for path in found:
             if path.name.endswith(PARTIAL_SUFFIX) or is_temp_name(path):
                 log_event(
                     logger,
@@ -62,13 +68,15 @@ class ToPrintQueue(WatcherCore):
         queue.
         """
         self._notified = {key for key in self._notified if Path(key[0]).exists()}
+        # First, move labels that printed earlier but could not be filed.
+        outcomes = self.reconcile_filing()
         files = self.queued_files()
         if not files:
             log_event(logger, logging.DEBUG, "to-print is empty", reason=reason)
-            return []
+            return outcomes
         discovery = self._discover("to-print retry")
         if discovery is None:
-            return []
+            return outcomes
         usable = [candidate.name for candidate in discovery.usable]
         available = bool(usable)
         changed = available != self._printers_available
@@ -82,7 +90,7 @@ class ToPrintQueue(WatcherCore):
                 retry_seconds=self.config.retry_seconds,
                 discovery_errors=discovery.errors,
             )
-            return []
+            return outcomes
         log_event(
             logger,
             logging.INFO,
@@ -91,7 +99,7 @@ class ToPrintQueue(WatcherCore):
             waiting=[path.name for path in files],
             usable_printers=usable,
         )
-        outcomes = []
+        attempted = 0
         for path in files:
             if self.stop_event.is_set():
                 log_event(logger, logging.INFO, "shutdown: leaving to-print as is")
@@ -102,12 +110,13 @@ class ToPrintQueue(WatcherCore):
                 logger.exception("unexpected error processing queued %s", path)
                 break
             outcomes.append(outcome)
+            attempted += 1
             if outcome.status in ("still_queued", "check_printer"):
                 log_event(
                     logger,
                     logging.WARNING,
                     "stopping this pass through to-print after a failure",
-                    remaining=len(files) - len(outcomes),
+                    remaining=len(files) - attempted,
                 )
                 break
         return outcomes
@@ -116,7 +125,13 @@ class ToPrintQueue(WatcherCore):
         self, outcome: FileOutcome, level: int = logging.INFO
     ) -> FileOutcome:
         self._count(f"queued_{outcome.status}")
-        if outcome.status in ("unsupported", "not_matching", "dry_run"):
+        if outcome.status in ("unsupported", "not_matching", "dry_run", "gave_up") or (
+            # Already sent to a printer but stuck here: reconcile_filing() retries
+            # the move each tick; scanning it again would only repeat that.
+            outcome.moved_to is None
+            and outcome.status
+            in ("duplicate", "move_pending", "printed", "check_printer")
+        ):
             signature = file_signature(outcome.path)
             if signature is not None:
                 self._decided[outcome.path] = signature
@@ -145,44 +160,53 @@ class ToPrintQueue(WatcherCore):
             return self._queued_outcome(FileOutcome("in_progress", path, in_progress))
         loaded = self._read_stable(path)
         if isinstance(loaded, FileOutcome):
+            if loaded.status in ("unstable", "unreadable"):
+                return self._defer_queued(loaded)
             return self._queued_outcome(loaded, logging.WARNING)
+        self._queued_deferred.pop(path, None)
         data, digest, size = loaded
         with attempt(
             "watcher queued label", file=str(path), sha256=digest, size_bytes=size
         ):
             return self._print_queued(path, digest, data)
 
-    def _print_queued(self, path: Path, digest: str, data: bytes) -> FileOutcome:
-        if digest in self._prior_in_flight:
-            outcome = self._file_interrupted(path, digest)
-            return self._queued_outcome(outcome, logging.WARNING)
-        age = self._recent_submission(digest)
-        if age is not None or digest in self._stuck_hashes:
-            age = age or 0.0
+    def _defer_queued(self, outcome: FileOutcome) -> FileOutcome:
+        """A locked or still-changing to-print file: retry on a few later ticks,
+        then tell the volunteer once and leave it alone until it changes."""
+        path = outcome.path
+        tries = self._queued_deferred.get(path, 0) + 1
+        self._queued_deferred[path] = tries
+        if tries <= MAX_DEFERRED_RETRIES:
             log_event(
                 logger,
                 logging.WARNING,
-                "queued label matches one just sent to a printer; moving it to "
-                "check-printer/ instead of printing a second copy",
-                file=path.name,
-                age_s=round(age, 1),
+                "will look at this queued file again on a later retry tick",
+                file=str(path),
+                deferred_try=tries,
+                of=MAX_DEFERRED_RETRIES,
+                retry_seconds=self.config.retry_seconds,
             )
-            moved_to = self.move_to(path, CHECK_PRINTER_DIR)
-            self._notify_once(
-                moved_to or path,
-                "duplicate",
-                messages.queued_duplicate(path, moved_to, age),
-            )
-            return self._queued_outcome(
-                FileOutcome(
-                    "duplicate",
-                    path,
-                    f"identical content sent {age:.1f}s ago",
-                    moved_to=moved_to,
-                    sha256=digest,
-                ),
-                logging.WARNING,
-            )
+            return self._queued_outcome(outcome, logging.WARNING)
+        self._queued_deferred.pop(path, None)
+        log_event(
+            logger,
+            logging.ERROR,
+            "giving up on this queued file after repeated transient problems; "
+            "it is retried once it changes (or is renamed)",
+            file=str(path),
+            tries=tries,
+        )
+        self._notify_once(
+            path, "unreadable", messages.queued_unreadable(path, outcome.detail)
+        )
+        return self._queued_outcome(
+            FileOutcome("gave_up", path, outcome.detail), logging.ERROR
+        )
+
+    def _print_queued(self, path: Path, digest: str, data: bytes) -> FileOutcome:
+        reserved = self._check_reservation(path, digest)
+        if reserved is not None:
+            return self._queued_outcome(reserved, logging.WARNING)
         decoded = self._decode(path, digest, data)
         if isinstance(decoded, FileOutcome):
             self._notify_once(
@@ -221,7 +245,6 @@ class ToPrintQueue(WatcherCore):
         if filed is not None:
             level = logging.INFO if filed.status == "printed" else logging.ERROR
             return self._queued_outcome(filed, level)
-        self._release_in_flight(digest)
         self._notify_once(
             path, "retry_failed", messages.retry_failed(path, submission.error)
         )

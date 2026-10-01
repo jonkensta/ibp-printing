@@ -32,6 +32,7 @@ from ibp_printing.models import (
     PrintResult,
 )
 from ibp_printing.watcher import __main__ as watcher_main
+from ibp_printing.watcher import notify
 from ibp_printing.watcher.config import (
     WatcherConfig,
     config_from_mapping,
@@ -322,7 +323,7 @@ class ConfigTests(TempDirTest):
         config = WatcherConfig()
         self.assertEqual((config.aspect_min, config.aspect_max), (1.4, 1.6))
         self.assertEqual(config.min_short_side_px, 400)
-        self.assertEqual(config.dedupe_seconds, 60)
+        self.assertEqual(config.duplicate_window_hours, 24)
         self.assertEqual(config.track_timeout_s, 60)
         self.assertEqual(config.heartbeat_minutes, 15)
         self.assertEqual(config.retry_seconds, 60)
@@ -332,7 +333,8 @@ class ConfigTests(TempDirTest):
         path = self.dir / "watcher.toml"
         path.write_text(
             'watch_dir = "~/Labels"\n'
-            "dedupe_seconds = 5\n"
+            "duplicate_window_hours = 5\n"
+            "dedupe_seconds = 60\n"
             "notify_on_failure = false\n"
             'globs = ["*.png"]\n'
             'track_timeout_s = "soon"\n'
@@ -342,13 +344,14 @@ class ConfigTests(TempDirTest):
         config, used, warnings = load_config(path)
         self.assertEqual(used, path)
         self.assertEqual(config.watch_dir, Path.home() / "Labels")
-        self.assertEqual(config.dedupe_seconds, 5.0)
-        self.assertIsInstance(config.dedupe_seconds, float)
+        self.assertEqual(config.duplicate_window_hours, 5.0)
+        self.assertIsInstance(config.duplicate_window_hours, float)
         self.assertFalse(config.notify_on_failure)
         self.assertEqual(config.globs, ["*.png"])
         self.assertEqual(config.track_timeout_s, 60.0)
-        self.assertEqual(len(warnings), 2)
+        self.assertEqual(len(warnings), 3)
         self.assertTrue(any("bogus" in warning for warning in warnings))
+        self.assertTrue(any("no longer used" in warning for warning in warnings))
         self.assertTrue(any("track_timeout_s" in warning for warning in warnings))
 
     def test_missing_and_broken_files(self) -> None:
@@ -494,29 +497,25 @@ class ProcessingTests(TempDirTest):
     def test_content_dedupe(self) -> None:
         backend = FakeBackend()
         ibp_printing.set_backend(backend)
-        clock = FakeClock()
-        clock.now = 1000.0
-        watcher, _ = self.make_watcher()
-        watcher._clock = clock
-        watcher._sleep = clock.sleep
+        watcher, notifier = self.make_watcher()
         make_label(self.dir / "label.png")
         shutil.copy(self.dir / "label.png", self.dir / "label (1).png")
+        shutil.copy(self.dir / "label.png", self.dir / "REPRINT label.png")
         self.assertEqual(watcher.process_path(self.dir / "label.png").status, "printed")
         with self.assertLogs("ibp_printing.watcher", logging.WARNING) as logs:
             dup = watcher.process_path(self.dir / "label (1).png")
         self.assertEqual(dup.status, "duplicate")
         self.assertTrue(any("DUPLICATE not printed" in line for line in logs.output))
-        self.assertTrue(any("rename the file" in line for line in logs.output))
-        self.assertTrue((self.dir / "label (1).png").exists())
+        self.assertTrue(any("REPRINT" in line for line in logs.output))
+        assert dup.moved_to is not None
+        self.assertEqual(dup.moved_to.parent, self.dir / PRINTED_DIR)
+        self.assertTrue(dup.moved_to.name.startswith("duplicate_"))
+        self.assertIn("already printed", notifier.texts[-1])
+        self.assertIn("REPRINT", notifier.texts[-1])
         self.assertEqual(len(backend.printed), 1)
-        clock.now += 61
-        # The unchanged duplicate is not re-decided by a stray event...
-        self.assertEqual(
-            watcher.process_path(self.dir / "label (1).png").status, "unchanged"
-        )
-        # ...but renaming it after the window prints it (a deliberate reprint).
-        renamed = (self.dir / "label (1).png").rename(self.dir / "label again.png")
-        self.assertEqual(watcher.process_path(renamed).status, "printed")
+        # A deliberate reprint: the name starts with REPRINT.
+        again = watcher.process_path(self.dir / "REPRINT label.png")
+        self.assertEqual(again.status, "printed")
         self.assertEqual(len(backend.printed), 2)
 
     def test_dry_run_prints_and_moves_nothing(self) -> None:
@@ -587,9 +586,11 @@ class ProcessingTests(TempDirTest):
         self.assertEqual(outcome.status, "printed")
         self.assertIsNone(outcome.moved_to)
         self.assertTrue(path.exists())
-        watcher.config.dedupe_seconds = 0
-        self.assertEqual(watcher._decided.get(path), None)
-        self.assertEqual(watcher.process_path(path).status, "duplicate")
+        # Seen again: the move is retried, the label is not printed again.
+        again = watcher.process_path(path)
+        self.assertEqual(again.status, "filed")
+        assert again.moved_to is not None
+        self.assertEqual(again.moved_to.parent, self.dir / PRINTED_DIR)
         self.assertEqual(len(backend.printed), 1)
 
     def test_move_retry_succeeds(self) -> None:
@@ -631,7 +632,7 @@ class ProcessingTests(TempDirTest):
 class NotifierTests(unittest.TestCase):
     """Tests for Notifier."""
 
-    def test_one_box_at_a_time(self) -> None:
+    def test_one_box_at_a_time_and_queued_messages_coalesce(self) -> None:
         release = threading.Event()
         shown: list[str] = []
 
@@ -643,15 +644,54 @@ class NotifierTests(unittest.TestCase):
 
         notifier = Notifier(enabled=True, show=show)
         self.assertTrue(notifier.notify("first"))
-        self.assertFalse(notifier.notify("second"))
-        release.set()
         deadline = time.monotonic() + 5
-        while not notifier.notify("third"):
+        while not shown:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.01)
+        # Accepted (queued), not dropped, while the first box is open.
+        self.assertTrue(notifier.notify("second"))
+        self.assertTrue(notifier.notify("third"))
+        self.assertEqual(notifier.pending, 2)
+        self.assertEqual(shown, ["first"])
         release.set()
-        time.sleep(0.05)
-        self.assertEqual(shown[:2], ["first", "third"])
+        while len(shown) < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertEqual(len(shown), 2)  # one combined box, not two
+        self.assertIn("second", shown[1])
+        self.assertIn("third", shown[1])
+        self.assertIn("2 more messages", shown[1])
+        while notifier._busy:  # the thread finishes; a new box starts at once
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertTrue(notifier.notify("fourth"))
+        while len(shown) < 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertEqual(shown[2], "fourth")
+
+    def test_pending_messages_are_bounded(self) -> None:
+        release = threading.Event()
+        shown: list[str] = []
+
+        def show(text: str, title: str) -> int:
+            del title
+            shown.append(text)
+            release.wait(5)
+            return 1
+
+        notifier = Notifier(enabled=True, show=show)
+        notifier.notify("open")
+        for number in range(notify.MAX_PENDING + 5):
+            self.assertTrue(notifier.notify(f"msg {number}"))
+        self.assertEqual(notifier.pending, notify.MAX_PENDING)
+        release.set()
+        deadline = time.monotonic() + 5
+        while len(shown) < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertIn("and 5 older messages", shown[1])
+        self.assertNotIn("msg 0", shown[1])
 
     def test_disabled(self) -> None:
         shown: list[str] = []

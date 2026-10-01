@@ -28,6 +28,7 @@ from ibp_printing.paths import (
 )
 from ibp_printing.watcher import messages
 from ibp_printing.watcher.core import (
+    MAX_DEFERRED_RETRIES,
     RETRY,
     FileOutcome,
     Submission,
@@ -54,10 +55,9 @@ __all__ = [
     "TO_PRINT_DIR",
     "FileOutcome",
     "LabelWatcher",
+    "MAX_DEFERRED_RETRIES",
 ]
 
-# A locked/unstable download is re-checked on this many later retry ticks.
-MAX_DEFERRED_RETRIES = 3
 # mtime/ctime resolution slack when comparing with the saved high-water mark.
 ARRIVAL_SLACK_S = 2.0
 # At most this many ignored files are examined for the startup warning.
@@ -67,7 +67,7 @@ IGNORED_SCAN_LIMIT = 50
 _UNFINISHED = frozenset({"shutdown", "unstable", "unreadable"})
 # Statuses remembered by file signature so an unchanged file is not re-decided.
 _DECIDED = frozenset(
-    {"not_label", "unsupported", "dry_run", "not_matching", "duplicate"}
+    {"not_label", "unsupported", "dry_run", "not_matching", "duplicate", "move_pending"}
 )
 
 
@@ -191,16 +191,7 @@ class LabelWatcher(ToPrintQueue):
         from watchdog.observers import Observer
 
         self.watch_dir.mkdir(parents=True, exist_ok=True)
-        prior = self._state_file.load(self.watch_dir) if self._state_file else None
-        if prior is not None and prior.in_flight:
-            self._prior_in_flight = dict(prior.in_flight)
-            log_event(
-                logger,
-                logging.WARNING,
-                "labels were being printed when the watcher last stopped; if "
-                "they reappear they go to check-printer/, not the printer",
-                in_flight=self._prior_in_flight,
-            )
+        prior = self.load_state()
         existing = self.snapshot_existing()
         snapshot = dict(self._startup_files)
         chosen = self._select_startup_files(existing, prior)
@@ -291,6 +282,7 @@ class LabelWatcher(ToPrintQueue):
                     "seen again)",
                     in_progress=str(self._current) if self._current else None,
                 )
+        self._hold_back_unseen()
         with self._pending_lock:
             unfinished = sorted(path.name for path in self._first_seen)
         if unfinished:
@@ -303,6 +295,36 @@ class LabelWatcher(ToPrintQueue):
             )
         self._save_state(clean=not worker_alive)
         log_event(logger, logging.INFO, "watcher stopped", stats=self.stats)
+
+    def _hold_back_unseen(self) -> None:
+        """Final scan after the observer stopped: hold the checkpoint back for
+        every candidate file that arrived but was never queued or decided
+        (events still inside watchdog at stop are lost), so the next start
+        processes it."""
+        late = []
+        for path in self.existing_files():
+            if is_temp_name(path) or matches_globs(path, self.config.globs) is None:
+                continue
+            signature = file_signature(path)
+            if signature is None:
+                continue
+            if self._decided.get(path) == signature:
+                continue
+            if path in self._startup_files and self._startup_files[path] == signature:
+                continue
+            with self._pending_lock:
+                if path in self._first_seen:
+                    continue
+                when = min(arrival_time(path) or time.time(), time.time())
+                self._first_seen[path] = when
+            late.append({"file": path.name, "arrived": iso(when)})
+        log_event(
+            logger,
+            logging.WARNING if late else logging.DEBUG,
+            "final scan after stopping the observer: files never processed (the "
+            "next start handles them)",
+            files=late,
+        )
 
     def observer_alive(self) -> bool:
         """True while the folder observer and all of its emitter threads run."""
@@ -323,8 +345,15 @@ class LabelWatcher(ToPrintQueue):
         return False
 
     def process_existing_now(self) -> list[FileOutcome]:
-        """Process every file in the folder, then to-print/, on this thread."""
+        """Process every file in the folder, then to-print/, on this thread.
+
+        Used by ``--once``: content reservations are read and written (so a
+        label is never printed twice across runs), but the Downloads
+        checkpoint is left alone unless this watcher was built with
+        ``checkpoint=True``.
+        """
         self.watch_dir.mkdir(parents=True, exist_ok=True)
+        self.load_state()
         files = self.existing_files()
         log_event(
             logger,
@@ -335,6 +364,7 @@ class LabelWatcher(ToPrintQueue):
         )
         outcomes = [self.process_path(path) for path in files]
         outcomes.extend(self.retry_queue_once("--once"))
+        self._save_state(clean=True)
         return outcomes
 
     def on_fs_event(self, kind: str, raw_path: str) -> None:
@@ -378,8 +408,12 @@ class LabelWatcher(ToPrintQueue):
                 )
                 return False
             del self._startup_files[path]
+        arrived = min(arrival_time(path) or time.time(), time.time())
         with self._pending_lock:
-            self._first_seen.setdefault(path, time.time())
+            # The arrival time, not "now": the checkpoint must never pass a
+            # file that was seen but not processed (it may be days old when a
+            # backlog is queued at startup).
+            self._first_seen.setdefault(path, arrived)
             if not self._accepting:
                 log_event(
                     logger,
@@ -606,41 +640,9 @@ class LabelWatcher(ToPrintQueue):
     def _process_candidate(  # pylint: disable=too-many-return-statements
         self, path: Path, digest: str, data: bytes
     ) -> FileOutcome:
-        if digest in self._prior_in_flight:
-            return self._finish(self._file_interrupted(path, digest), logging.WARNING)
-        if digest in self._stuck_hashes:
-            return self._finish(
-                FileOutcome(
-                    "duplicate",
-                    path,
-                    "content already printed but could not be moved earlier",
-                    sha256=digest,
-                ),
-                logging.WARNING,
-            )
-        age = self._recent_submission(digest)
-        if age is not None:
-            window = self.config.dedupe_seconds
-            log_event(
-                logger,
-                logging.WARNING,
-                "DUPLICATE not printed: identical content was sent to a printer "
-                f"{age:.1f}s ago. For a deliberate reprint, wait until "
-                f"{window:.0f}s have passed, then rename the file.",
-                file=path.name,
-                dedupe_seconds=window,
-            )
-            self._notify_once(path, "duplicate", messages.duplicate(path, age, window))
-            return self._finish(
-                FileOutcome(
-                    "duplicate",
-                    path,
-                    f"identical content sent to a printer {age:.1f}s ago "
-                    f"(dedupe window {window}s)",
-                    sha256=digest,
-                ),
-                logging.WARNING,
-            )
+        reserved = self._check_reservation(path, digest)
+        if reserved is not None:
+            return self._finish(reserved, logging.WARNING)
 
         decoded = self._decode(path, digest, data)
         if isinstance(decoded, FileOutcome):
@@ -687,7 +689,6 @@ class LabelWatcher(ToPrintQueue):
                 filed, logging.INFO if filed.status == "printed" else logging.ERROR
             )
         moved_to = self.move_to(path, TO_PRINT_DIR)
-        self._release_in_flight(digest)
         self._notify_once(
             moved_to or path,
             "did_not_print",

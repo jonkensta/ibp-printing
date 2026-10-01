@@ -29,7 +29,7 @@ from ibp_printing.watcher.detect import (
     wait_until_stable,
 )
 from ibp_printing.watcher.service import RETRY
-from ibp_printing.watcher.state import FolderState, StateFile
+from ibp_printing.watcher.state import FolderState, Reservation, StateFile
 
 from test_watcher import (  # pylint: disable=wrong-import-order
     FakeBackend,
@@ -198,6 +198,8 @@ class ToPrintQueueTests(TempDirTest):
         self.assertEqual([o.status for o in outcomes], ["printed"])
 
     def test_queued_copy_of_just_printed_label_is_not_printed_again(self) -> None:
+        # The cross-path case: the app saved the label to to-print/, and the
+        # volunteer also downloaded it.
         backend = FakeBackend()
         ibp_printing.set_backend(backend)
         watcher, notifier = self.make_watcher()
@@ -208,7 +210,8 @@ class ToPrintQueueTests(TempDirTest):
         self.assertEqual([o.status for o in outcomes], ["duplicate"])
         self.assertFalse(queued.exists())
         assert outcomes[0].moved_to is not None
-        self.assertEqual(outcomes[0].moved_to.parent.name, CHECK_PRINTER_DIR)
+        self.assertEqual(outcomes[0].moved_to.parent.name, PRINTED_DIR)
+        self.assertTrue(outcomes[0].moved_to.name.startswith("duplicate_"))
         self.assertEqual(len(backend.printed), 1)
         self.assertEqual(len(notifier.texts), 1)
 
@@ -260,8 +263,10 @@ class DedupeTests(TempDirTest):
         dup = watcher.process_path(self.dir / "label (1).png")
         self.assertEqual(dup.status, "duplicate")
         self.assertEqual(backend.attempts, 1)
-        self.assertIn("sent to the printer", notifier.texts[-1])
-        self.assertIn("rename the file", notifier.texts[-1])
+        self.assertIn("could not tell whether it printed", notifier.texts[-1])
+        self.assertIn("REPRINT", notifier.texts[-1])
+        assert dup.moved_to is not None
+        self.assertEqual(dup.moved_to.parent.name, CHECK_PRINTER_DIR)
 
     def test_hash_released_after_definite_failure(self) -> None:
         backend = FakeBackend(raise_error="no spooler")
@@ -277,18 +282,35 @@ class DedupeTests(TempDirTest):
         )
         self.assertEqual(backend.attempts, 2)
 
-    def test_stuck_hash_only_marked_when_printed(self) -> None:
-        ibp_printing.set_backend(FakeBackend(outcome=JobOutcome.ERROR))
+    def test_unmovable_check_printer_label_stays_reserved(self) -> None:
+        backend = FakeBackend(outcome=JobOutcome.ERROR)
+        ibp_printing.set_backend(backend)
         watcher, _ = self.make_watcher()
         watcher._sleep = lambda seconds: None
+        path = make_label(self.dir / "label.png")
         with mock.patch(
             "ibp_printing.watcher.core.os.rename",
             side_effect=PermissionError(13, "in use"),
         ):
-            outcome = watcher.process_path(make_label(self.dir / "label.png"))
-        self.assertEqual(outcome.status, "check_printer")
-        self.assertIsNone(outcome.moved_to)
-        self.assertEqual(watcher._stuck_hashes, set())
+            outcome = watcher.process_path(path)
+            self.assertEqual(outcome.status, "check_printer")
+            self.assertIsNone(outcome.moved_to)
+            reservation = watcher.reservations()[outcome.sha256 or ""]
+            self.assertEqual(reservation.status, "filing")
+            self.assertEqual(reservation.dest, CHECK_PRINTER_DIR)
+            # A stray event much later: still not printed again.
+            watcher._now = lambda: time.time() + 30 * 24 * 3600
+            self.assertEqual(watcher.process_path(path).status, "move_pending")
+        self.assertEqual(backend.attempts, 1)
+        # Once the file is free, the next retry tick moves it.
+        outcomes = watcher.reconcile_filing()
+        self.assertEqual([o.status for o in outcomes], ["filed"])
+        assert outcomes[0].moved_to is not None
+        self.assertEqual(outcomes[0].moved_to.parent.name, CHECK_PRINTER_DIR)
+        self.assertEqual(
+            watcher.reservations()[outcome.sha256 or ""].status, "uncertain"
+        )
+        self.assertEqual(backend.attempts, 1)
 
 
 class TransientTests(TempDirTest):
@@ -379,31 +401,91 @@ class TransientTests(TempDirTest):
 
 
 class StateFileTests(TempDirTest):
-    """W7: the state file round-trips and survives corruption."""
+    """W7/R8: the state file round-trips, migrates and survives corruption."""
 
     def test_round_trip_keeps_other_folders(self) -> None:
         state = self.state_file()
-        self.assertIsNone(state.load(self.dir))
+        self.assertIsNone(state.load(self.dir).folder)
         folder = FolderState(seen_until=100.0, updated=101.0, clean_shutdown=True)
-        folder.in_flight = {"abc": {"file": "x.png", "since": time.time()}}
-        self.assertTrue(state.save(self.dir, folder))
+        reservations = {
+            "abc": Reservation(
+                status="printed",
+                first_submitted=5.0,
+                updated=6.0,
+                file="x.png",
+                completed=6.0,
+            )
+        }
+        self.assertTrue(state.save(self.dir, folder, reservations))
         other = self.dir / "other"
-        state.save(other, FolderState(seen_until=5.0, updated=5.0))
+        state.save(other, FolderState(seen_until=5.0, updated=5.0), reservations)
         loaded = StateFile(state.path).load(self.dir)
-        assert loaded is not None
-        self.assertEqual(loaded.seen_until, 100.0)
-        self.assertTrue(loaded.clean_shutdown)
-        self.assertEqual(loaded.in_flight["abc"]["file"], "x.png")
-        self.assertIsNotNone(StateFile(state.path).load(other))
+        assert loaded.folder is not None
+        self.assertEqual(loaded.folder.seen_until, 100.0)
+        self.assertTrue(loaded.folder.clean_shutdown)
+        self.assertEqual(loaded.reservations["abc"].file, "x.png")
+        self.assertEqual(loaded.reservations["abc"].completed, 6.0)
+        self.assertIsNotNone(StateFile(state.path).load(other).folder)
+        doc = json.loads(state.path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["version"], 2)
 
-    def test_old_in_flight_entries_expire(self) -> None:
+    def test_folder_entry_can_be_left_unchanged(self) -> None:
         state = self.state_file()
-        folder = FolderState(seen_until=1.0, updated=1.0)
-        folder.in_flight = {"old": {"file": "x", "since": 1.0}}
-        state.save(self.dir, folder)
+        state.save(self.dir, FolderState(seen_until=7.0, updated=7.0), {})
+        again = StateFile(state.path)
+        again.load(self.dir)
+        self.assertTrue(again.save(self.dir, None, {}))
         loaded = StateFile(state.path).load(self.dir)
-        assert loaded is not None
-        self.assertEqual(loaded.in_flight, {})
+        assert loaded.folder is not None
+        self.assertEqual(loaded.folder.seen_until, 7.0)
+
+    def test_version_1_file_is_migrated(self) -> None:
+        state = self.state_file()
+        key = os.path.normcase(str(self.dir))
+        state.path.parent.mkdir(parents=True, exist_ok=True)
+        state.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "watch_dirs": {
+                        key: {
+                            "seen_until": 50.0,
+                            "seen_until_local": "x",
+                            "updated": 60.0,
+                            "updated_local": "x",
+                            "clean_shutdown": False,
+                            "in_flight": {"d1": {"file": "/dl/a.png", "since": 55.0}},
+                            "mystery": 1,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertLogs("ibp_printing.watcher.state", logging.WARNING) as logs:
+            loaded = StateFile(state.path).load(self.dir)
+        assert loaded.folder is not None
+        self.assertEqual(loaded.folder.seen_until, 50.0)
+        reservation = loaded.reservations["d1"]
+        self.assertEqual(reservation.status, "filing")
+        self.assertIsNone(reservation.dest)  # outcome unknown -> check-printer
+        self.assertEqual(reservation.file, "/dl/a.png")
+        self.assertTrue(any("migrat" in line for line in logs.output))
+        self.assertTrue(any("mystery" in line for line in logs.output))
+
+    def test_bad_reservation_does_not_cost_the_others(self) -> None:
+        state = self.state_file()
+        good = Reservation(status="uncertain", first_submitted=1.0, updated=1.0)
+        doc = {
+            "version": 2,
+            "watch_dirs": {},
+            "reservations": {"good": good.to_json(), "bad": {"status": "weird"}},
+        }
+        state.path.parent.mkdir(parents=True, exist_ok=True)
+        state.path.write_text(json.dumps(doc), encoding="utf-8")
+        with self.assertLogs("ibp_printing.watcher.state", logging.WARNING):
+            loaded = StateFile(state.path).load(self.dir)
+        self.assertEqual(list(loaded.reservations), ["good"])
 
     def test_corrupt_files_are_logged_and_ignored(self) -> None:
         state = self.state_file()
@@ -412,24 +494,25 @@ class StateFileTests(TempDirTest):
             "{not json",
             "[]",
             json.dumps({"watch_dirs": {key: {"seen_until": "soon"}}}),
-            json.dumps({"watch_dirs": {key: {"seen_until": 1, "in_flight": []}}}),
             "\x00\x01",
         ):
             with self.subTest(content=content):
                 state.path.parent.mkdir(parents=True, exist_ok=True)
                 state.path.write_text(content, encoding="utf-8")
                 with self.assertLogs("ibp_printing.watcher.state", logging.WARNING):
-                    self.assertIsNone(state.load(self.dir))
+                    loaded = state.load(self.dir)
+                self.assertIsNone(loaded.folder)
+                self.assertEqual(loaded.reservations, {})
                 # And it is simply rewritten on the next save.
-                self.assertTrue(state.save(self.dir, FolderState(1.0, 1.0)))
-                self.assertIsNotNone(StateFile(state.path).load(self.dir))
+                self.assertTrue(state.save(self.dir, FolderState(1.0, 1.0), {}))
+                self.assertIsNotNone(StateFile(state.path).load(self.dir).folder)
 
     def test_unwritable_state_does_not_raise(self) -> None:
         blocker = self.state_dir / "file"
         blocker.write_text("x")
         state = StateFile(blocker / "watcher-state.json")
-        self.assertIsNone(state.load(self.dir))
-        self.assertFalse(state.save(self.dir, FolderState(1.0, 1.0)))
+        self.assertIsNone(state.load(self.dir).folder)
+        self.assertFalse(state.save(self.dir, FolderState(1.0, 1.0), {}))
 
 
 class StartupTests(TempDirTest):
@@ -456,7 +539,7 @@ class StartupTests(TempDirTest):
         old = make_label(self.dir / "old.png", seed=1)
         new = make_label(self.dir / "new.png", seed=2)
         state = self.state_file()
-        state.save(self.dir, FolderState(seen_until=1000.0, updated=1000.0))
+        state.save(self.dir, FolderState(seen_until=1000.0, updated=1000.0), {})
         times = {old: 900.0, new: 1500.0}
         watcher, _ = self.make_watcher(state=StateFile(state.path))
         with mock.patch.object(
@@ -480,8 +563,11 @@ class StartupTests(TempDirTest):
         digest = sha256_bytes(path.read_bytes())
         state = self.state_file()
         folder = FolderState(seen_until=0.0, updated=0.0)
-        folder.in_flight = {digest: {"file": str(path), "since": time.time()}}
-        state.save(self.dir, folder)
+        since = time.time()
+        reservation = Reservation(
+            status="filing", first_submitted=since, updated=since, file=str(path)
+        )
+        state.save(self.dir, folder, {digest: reservation})
         watcher, notifier = self.make_watcher(state=StateFile(state.path))
         watcher.start()
         self.addCleanup(watcher.stop)
@@ -493,9 +579,10 @@ class StartupTests(TempDirTest):
         self.assertIn("stopped while this shipping label", notifier.texts[0])
         watcher.stop()
         saved = StateFile(state.path).load(self.dir)
-        assert saved is not None
-        self.assertEqual(saved.in_flight, {})
-        self.assertTrue(saved.clean_shutdown)
+        assert saved.folder is not None
+        self.assertTrue(saved.folder.clean_shutdown)
+        # Never expires: it stays "uncertain" for good.
+        self.assertEqual(saved.reservations[digest].status, "uncertain")
 
     def test_file_created_between_snapshot_and_observer_is_caught(self) -> None:
         backend = FakeBackend()
@@ -546,10 +633,10 @@ class ShutdownTests(TempDirTest):
         self.assertTrue(second.exists())
         self.assertEqual(len(backend.printed), 1)
         saved = StateFile(state.path).load(self.dir)
-        assert saved is not None
-        self.assertTrue(saved.clean_shutdown)
-        self.assertEqual(saved.in_flight, {})
-        self.assertLessEqual(saved.seen_until, time.time())
+        assert saved.folder is not None
+        self.assertTrue(saved.folder.clean_shutdown)
+        self.assertEqual([r.status for r in saved.reservations.values()], ["printed"])
+        self.assertLessEqual(saved.folder.seen_until, time.time())
 
         # The next start prints the label that was still queued.
         backend.gate = None
@@ -627,7 +714,7 @@ class HealthTests(TempDirTest):
         with self.assertLogs("ibp_printing.watcher.service", logging.INFO) as logs:
             watcher.heartbeat()
         self.assertTrue(any("heartbeat" in line for line in logs.output))
-        self.assertIsNotNone(StateFile(state.path).load(self.dir))
+        self.assertIsNotNone(StateFile(state.path).load(self.dir).folder)
 
 
 if __name__ == "__main__":

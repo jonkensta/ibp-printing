@@ -6,6 +6,7 @@ Also runnable as ``python -m ibp_printing.watcher`` (or ``pythonw -m ...``).
 import argparse
 import importlib.metadata
 import logging
+import os
 import signal
 import sys
 import threading
@@ -20,7 +21,7 @@ from ibp_printing.log import (
     install_exception_hooks,
     log_event,
 )
-from ibp_printing.paths import downloads_dir
+from ibp_printing.paths import TO_PRINT_DIR, downloads_dir, to_print_dir
 from ibp_printing.watcher.config import WatcherConfig, load_config
 from ibp_printing.watcher.instance import SingleInstance
 from ibp_printing.watcher.notify import MB_ICONERROR, MB_SETFOREGROUND, message_box
@@ -227,20 +228,37 @@ def _run_locked(
         _fatal_box(f"The label watcher cannot find the folder:\n{watch_dir}")
         return EXIT_BAD_WATCH_DIR
 
-    # A dry run or --once must not move the "seen up to" mark: files it only
-    # pretended to print would then be skipped by the next real run.
+    # A dry run is stateless: it must not move the "seen up to" mark (files it
+    # only pretended to print would then be skipped by the next real run) nor
+    # record reservations. A real --once run prints for real, so it reads and
+    # writes the content reservations, but leaves the Downloads checkpoint.
     state: Optional[StateFile] = None
-    if args.once or config.dry_run:
+    if config.dry_run:
         log_event(
             logger,
             logging.INFO,
-            "state file not used (dry run or --once): files already in the "
+            "dry run: state file not read or written; files already in the "
             "folder are handled as on a first run",
         )
     else:
         state = StateFile(state_dir / STATE_FILENAME)
+        if args.once:
+            log_event(
+                logger,
+                logging.INFO,
+                "--once: label reservations are read and saved; the Downloads "
+                "checkpoint is left unchanged",
+            )
+    queues = to_print_dirs(watch_dir)
     stop = threading.Event()
-    watcher = LabelWatcher(config, watch_dir, stop_event=stop, state=state)
+    watcher = LabelWatcher(
+        config,
+        watch_dir,
+        stop_event=stop,
+        state=state,
+        to_print_dirs=queues,
+        checkpoint=not args.once,
+    )
     _log_startup(watcher)
 
     if args.once:
@@ -286,6 +304,38 @@ def _run_locked(
         heartbeat.join(2.0)
     log_event(logger, logging.INFO, "label watcher exited cleanly", stats=watcher.stats)
     return EXIT_OK
+
+
+def to_print_dirs(watch_dir: Path) -> list[Path]:
+    """The to-print folders to retry: ``<watch_dir>/to-print`` first, plus the
+    folder shippy/shippy-gui save into (``paths.to_print_dir()``) when it is a
+    different one (the watcher watches a custom folder). Both are logged."""
+    own = watch_dir / TO_PRINT_DIR
+    try:
+        apps = to_print_dir().expanduser().resolve()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        log_event(
+            logger,
+            logging.WARNING,
+            "could not work out where the apps save unprinted labels; retrying "
+            "only the watch folder's to-print",
+            error=describe_exception(exc),
+        )
+        apps = own
+    same = os.path.normcase(str(apps)) == os.path.normcase(str(own))
+    log_event(
+        logger,
+        logging.INFO if same else logging.WARNING,
+        "to-print folders retried",
+        watch_folder_queue=str(own),
+        app_queue=str(apps),
+        note=(
+            "same folder"
+            if same
+            else "the apps save labels outside the watch folder; both are retried"
+        ),
+    )
+    return [own] if same else [own, apps]
 
 
 def _version() -> str:

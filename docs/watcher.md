@@ -10,7 +10,9 @@ label was bought.
 label but can't get it to a printer (no printer plugged in, the spooler refused
 the job), they no longer refund the postage. They save the label image into
 `Downloads\to-print\` and tell the volunteer where it went. The watcher checks
-that folder every minute (`retry_seconds`). As soon as a usable label printer is
+that folder every minute (`retry_seconds`). If the watcher watches some other
+folder (`--watch-dir`), it retries both `<watch folder>\to-print\` and the
+apps' `Downloads\to-print\`, and logs both at startup. As soon as a usable label printer is
 found, it prints the waiting labels, oldest first, and moves each one to
 `Downloads\printed\`. Volunteers do **not** need to download labels from the
 EasyPost website any more; they only need to fix the printer.
@@ -34,7 +36,32 @@ All three are inside the watched folder (Downloads):
 | --- | --- | --- |
 | `to-print\` | Labels that definitely did **not** reach any printer: saved by shippy/shippy-gui, or downloads the watcher itself could not print. | Retries them every `retry_seconds` while a usable printer exists. Leaves a file there while it keeps failing (one message box per file, not one per retry). |
 | `printed\` | Labels a printer accepted. | Nothing; a record. |
-| `check-printer\` | Labels that were sent to a printer whose queue then reported a problem (error, timeout, deleted, tracking failed), or whose fate is unknown. | **Never** retries them: they may still come out once the printer is fixed. A message box asks the volunteer to check the printer and its queue first. To print one again, move it into `to-print\`. |
+| `check-printer\` | Labels that were sent to a printer whose queue then reported a problem (error, timeout, deleted, tracking failed), or whose fate is unknown (including the watcher stopping mid-print), and other copies of such labels. | **Never** retries them: they may still come out once the printer is fixed. A message box asks the volunteer to check the printer and its queue first. To print one again, rename it so the name starts with `REPRINT` and move it into `to-print\` (see below). |
+
+A label is filed into the result folders next to the `to-print\` folder it came
+from: a label from the apps' `Downloads\to-print\` goes to `Downloads\printed\`
+or `Downloads\check-printer\` even when the watcher watches another folder.
+
+### Never printed twice: label reservations
+
+Before a label goes to a printer, the watcher records its content (SHA-256)
+in the state file. Any other copy of the same label (`label (1).png`, a copy the
+app saved to `to-print\` *and* one the volunteer downloaded, a file dragged back
+from `check-printer\`) is then **not** printed:
+
+- if the label printed, the copy is moved to `printed\duplicate_...` with a
+  WARNING in the log and a message box. This lasts `duplicate_window_hours`
+  (24) after it printed, across restarts;
+- if the label may or may not have printed, the copy goes to `check-printer\`
+  with a message box. This never expires.
+
+**Deliberate reprint:** rename the file so its name starts with `REPRINT` (any
+case, e.g. `REPRINT-label.png`) and put it in Downloads or `to-print\`. Such a
+file is printed even though the label printed before.
+
+If a printed label can't be moved out of the way (antivirus, an image viewer
+holds it), the watcher keeps retrying the **move** every `retry_seconds` and
+after restarts; it never prints that file again.
 
 Files ending in `.partial` are labels still being written by an app; the
 watcher ignores them until they are renamed.
@@ -66,15 +93,13 @@ For a new file in **Downloads**:
    1.4 and 1.6 (a 4x6 label is exactly 1.5), and the short side must be at least
    400 px. Anything else, such as a photo or a letter-size PDF, stays where it
    is, untouched.
-7. It skips a file whose content (SHA-256) was sent to a printer in the last
-   `dedupe_seconds` (60) **whatever the outcome**, so an accidental second
-   download (`label (1).png`) of a label that is stuck in the printer queue is
-   not queued behind it. The skip is logged at WARNING and shown in a message
-   box. **For a deliberate reprint, wait 60 seconds, then rename the file** (or
-   drop it into `to-print\`). Only a definite failure releases the content
-   right away.
-8. It prints with `print_to_first_available`, then follows the print job in the
-   spooler for up to 60 seconds.
+7. It checks the label reservations (above): a copy of a label that printed
+   or may have printed is filed away instead of printed, unless its name starts
+   with `REPRINT`.
+8. It records the reservation in the state file, then prints with
+   `print_to_first_available` and follows the print job in the spooler for up
+   to 60 seconds. Only a definite failure (the label never reached the spooler)
+   releases the reservation.
 9. It files the label, adding a `YYYYmmdd-HHMMSS_` prefix to the name:
    - printed: `printed\`;
    - definitely not printed (no usable printer, or the spooler refused the job):
@@ -82,21 +107,25 @@ For a new file in **Downloads**:
    - sent, but the queue reported a problem, or the outcome is uncertain:
      `check-printer\`.
 
-   If the file is locked it retries the move a few times. If a printed file
-   still can't be moved, it stays where it is and is remembered, so it isn't
-   printed twice.
+   If the file is locked it retries the move a few times. If it still can't be
+   moved, it stays where it is, its reservation says where it belongs, and the
+   move is retried on every retry tick and after restarts; it is never printed
+   again.
 10. For anything but a clean print, a warning box (always on top) says what
-    happened and where the file went. Only one box is shown at a time.
+    happened and where the file went. Only one box is shown at a time; messages
+    that arrive while a box is open are shown together in one box when it is
+    closed.
 
 For the **to-print** folder, every `retry_seconds` (60): if it holds any files,
 the watcher runs one printer discovery. If no printer is usable it waits for the
 next tick, without a message box (the app already told the volunteer). If one
 is usable, it prints the files oldest first, with the same reading and
-duplicate checks (a to-print file whose content was just sent to a printer goes
-to `check-printer\` instead of printing twice). It does not apply the shape
-check to to-print files, since they were put there on purpose, but logs a
-warning if one isn't 4x6-shaped. It stops the pass at the first failure, so a
-broken printer isn't fed the whole queue.
+reservation checks. It does not apply the shape check to to-print files, since
+they were put there on purpose, but logs a warning if one isn't 4x6-shaped. It
+stops the pass at the first printer failure, so a broken printer isn't fed the
+whole queue. A to-print file that stays locked or keeps changing is looked at
+again on the next few ticks, then reported once in a message box and left
+alone until it is renamed or changed.
 
 ### Starting, stopping and crashes
 
@@ -105,11 +134,19 @@ broken printer isn't fed the whole queue.
   `~/.local/state/ibp-printing/watcher.lock`), whatever `--log-dir` or
   `--watch-dir` say. A second copy exits with code 1 before opening any log
   file. When it has no console, it shows a message box.
-- **State file.** Next to the lock, `watcher-state.json` records how far the
-  watcher has looked at each watched folder, whether it shut down cleanly, and
-  which labels were being printed. If it is unreadable or corrupt the watcher
-  logs a warning, ignores it and rewrites it; it never stops the watcher. Dry
-  runs and `--once` don't read or write it.
+- **State file.** Next to the lock, `watcher-state.json` (schema version 2)
+  records how far the watcher has looked at each watched folder
+  (`seen_until`), whether it shut down cleanly, and the label reservations
+  (`filing`: sent, not yet moved into its result folder; `printed`;
+  `uncertain`). Version 1 files are migrated: a label that was "in flight" is
+  treated as possibly printed. Unknown fields are logged and ignored. If the
+  file is unreadable or corrupt the watcher logs a warning, ignores it and
+  rewrites it; it never stops the watcher. If it **can't be written** (disk
+  full, read-only folder), the watcher keeps printing but logs CRITICAL on
+  every failed save and shows one message box: protection against printing a
+  label twice after a crash is then weakened. `--once` reads and writes the
+  reservations (it prints for real) but leaves `seen_until` alone. Dry runs
+  don't read or write the file at all.
 - **On start**, files that arrived (or were still queued) while the watcher was
   not running are processed. On the very first run, files already in Downloads
   are ignored unless you pass `--process-existing`. Either way, the log gets a
@@ -119,10 +156,14 @@ broken printer isn't fed the whole queue.
 - **On stop** (Ctrl+C, logoff, `schtasks /End`), the watcher stops taking new
   files, finishes the label it is printing (waiting up to
   `stable_timeout_s + track_timeout_s + 30` seconds), and keeps the instance lock
-  until then. Files still queued are processed at the next start.
+  until then. After stopping the folder observer it scans the folder once more,
+  so a download whose event was lost during shutdown is still remembered. Files
+  still queued, or never seen, are processed at the next start: `seen_until`
+  never moves past the arrival time of a file that was not handled.
 - **After a crash**, a label that was being printed is not printed again
-  automatically: if it is still there at the next start it goes to
-  `check-printer\` with a message box.
+  automatically: at the next start it goes to `check-printer\` with a message
+  box, and so does any other copy of it. (On Linux the smoke test showed why:
+  the killed watcher's `lp` still delivered the job afterwards.)
 - The heartbeat checks that the folder observer and its threads are alive and
   restarts the observer (and rescans the folder) if they died.
 
@@ -231,7 +272,7 @@ where `ibp-printing[watcher]` is installed.
 | `--log-dir PATH` | Write logs here instead of the default log folder. (The lock and state file stay in the fixed per-user folder.) |
 | `--process-existing` | Handle every matching file already in the folder at startup, not just the ones that arrived since the watcher last looked. |
 | `--dry-run` | Do everything except print: decide, log `DRY RUN: would print`, move nothing. |
-| `--once` | Process the files already in the folder and in `to-print\`, then exit (no watching). Combine with `--dry-run` to test detection on a folder of samples. |
+| `--once` | Process the files already in the folder and in `to-print\`, then exit (no watching). It uses the label reservations like the running watcher, so it never prints a label twice. Combine with `--dry-run` to test detection on a folder of samples. |
 | `-v`, `--verbose` | Show DEBUG lines on the console. The log files always get DEBUG. |
 
 ## Config file
@@ -261,9 +302,11 @@ aspect_min = 1.4
 aspect_max = 1.6
 min_short_side_px = 400
 
-# Identical content sent to a printer this many seconds ago (whatever the
-# outcome) is not sent again. Wait this long, then rename, to reprint.
-dedupe_seconds = 60
+# Another copy of a label that printed is not printed for this many hours
+# after it printed (a label that may or may not have printed is never re-sent).
+# Name a file REPRINT... to print it anyway. Replaces dedupe_seconds, which is
+# now ignored with a warning.
+duplicate_window_hours = 24
 
 # How often to retry labels in to-print\ (one printer discovery per tick,
 # only when the folder has files), and re-check temporarily locked downloads.
@@ -381,12 +424,14 @@ Outcomes you'll see in `file outcome: ...` lines (Downloads) and
 | `printed` | Spooled and the job finished (or left the queue) cleanly. | `printed\` |
 | `to_print` | A download that definitely didn't reach a printer (no usable printer, spool refused). | `to-print\` (retried) |
 | `still_queued` | A to-print label failed again. | stays in `to-print\` |
-| `check_printer` | Sent, but the queue reported a problem or the outcome is unknown; or the watcher stopped mid-print. | `check-printer\` |
-| `duplicate` | Same content was sent to a printer within `dedupe_seconds`. | no (to-print copies go to `check-printer\`) |
+| `check_printer` | Sent, but the queue reported a problem or the outcome is unknown. | `check-printer\` |
+| `duplicate` | A copy of a label that printed (within `duplicate_window_hours`) or may have printed. | `printed\duplicate_...` or `check-printer\duplicate_...` |
+| `filed` | A label sent to a printer earlier (before a failed move, or when the watcher stopped mid-print) was moved now. Never printed again. | `printed\` or `check-printer\` |
+| `move_pending` | Such a label still couldn't be moved; retried every tick. | no |
 | `dry_run` | Would have printed (`--dry-run`). | no |
 | `in_progress` | Browser placeholder (0 bytes or a `.part` sibling); handled when the download finishes. | no |
 | `unreadable` / `unstable` | Locked, still changing, or empty; looked at again on the next retry ticks. | no |
-| `gave_up` | Still locked after the retries; a message box says so. | no |
+| `gave_up` | Still locked after the retries; a message box says so. In `to-print\`, it is retried once renamed or changed. | no |
 | `shutdown` | The watcher was stopping; handled at the next start. | no |
 | `not_label` | Wrong shape or too small. | no |
 | `not_matching` | File name doesn't match `globs`. | no |
@@ -406,5 +451,12 @@ python -c "from PIL import Image; Image.new('L', (1200, 1800), 255).save('/tmp/d
 # a label waiting in the print queue folder:
 python -c "import ibp_printing; from pathlib import Path; from PIL import Image; ibp_printing.save_for_retry(Image.new('L', (1200, 1800), 255), 'TEST123', watch_dir=Path('/tmp/dl'))"
 ```
+
+Without pycups, the Linux backend uses `lpstat -p` and `lp`, so a fake printer is
+two small shell scripts early on `PATH`: `lpstat` printing
+`printer Fake_Label is idle.`, and `lp` copying its last argument somewhere
+(exit 1 to simulate a dead printer). Set `XDG_STATE_HOME` to a scratch folder
+to keep the test's state file apart. Note that the watcher also retries the
+apps' queue, `~/Downloads/to-print`, when you watch another folder.
 
 Run the tests with `uv run python -m unittest discover -s tests`.

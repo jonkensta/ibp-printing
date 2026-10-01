@@ -27,8 +27,11 @@ class WatcherConfig:  # pylint: disable=too-many-instance-attributes
     aspect_min: float = 1.4
     aspect_max: float = 1.6
     min_short_side_px: int = 400
-    # Identical content sent to a printer this recently is not sent again.
-    dedupe_seconds: float = 60.0
+    # A label that printed is not printed again from another copy (a manual
+    # download of a label the app saved to to-print/, a "label (1).png") for
+    # this many hours after it printed. Labels whose fate is uncertain are never
+    # re-sent automatically. Name a file REPRINT... to print it anyway.
+    duplicate_window_hours: float = 24.0
     # How often to retry labels waiting in <watch_dir>/to-print/ (and re-check
     # downloads that were temporarily locked).
     retry_seconds: float = 60.0
@@ -52,6 +55,13 @@ class WatcherConfig:  # pylint: disable=too-many-instance-attributes
 
 
 _PATH_KEYS = {"watch_dir", "log_dir"}
+# Keys older versions understood; reported with a specific warning, then ignored.
+_RETIRED_KEYS = {
+    "dedupe_seconds": (
+        "dedupe_seconds is no longer used: duplicates are now remembered across "
+        "restarts for duplicate_window_hours (default 24); ignored"
+    ),
+}
 
 
 def default_config_path() -> Path:
@@ -98,6 +108,9 @@ def config_from_mapping(data: dict[str, Any]) -> tuple[WatcherConfig, list[str]]
     warnings: list[str] = []
     known = {f.name for f in dataclasses.fields(WatcherConfig)}
     for key, value in data.items():
+        if key in _RETIRED_KEYS:
+            warnings.append(_RETIRED_KEYS[key])
+            continue
         if key not in known:
             warnings.append(f"unknown config key {key!r} ignored")
             continue
