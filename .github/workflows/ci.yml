@@ -8,6 +8,7 @@ jobs:
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -40,4 +41,7 @@ jobs:
         run: uv run mypy src
 
       - name: Test
-        run: uv run python -m unittest discover -s tests
+        timeout-minutes: 10
+        # Verbose, with a per-test watchdog that dumps all stacks and exits
+        # if a single test hangs for more than 90 seconds.
+        run: uv run python tests/run_tests.py 90
