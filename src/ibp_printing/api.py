@@ -70,8 +70,14 @@ def print_image(
 ) -> PrintResult:
     """Print to a specific printer.
 
+    Check ``result.outcome.ok``: ``JobOutcome.UNCERTAIN`` means a failure
+    after StartDoc where the label may still print, and
+    ``JobOutcome.TRACKING_FAILED`` means it was spooled but could not be
+    followed. Neither should be refunded or resent automatically.
+
     Raises:
-        PrintError: (a RuntimeError) if the job could not be spooled.
+        PrintError: (a RuntimeError) only if the job definitely never reached
+            the spooler.
     """
     with attempt("print_image", printer=printer_name, image=describe_image(img)):
         result = get_backend().print_image(
@@ -92,11 +98,14 @@ def print_to_first_available(
 ) -> PrintResult:
     """Print to the best usable label printer, falling back to the next one.
 
-    Fallback only happens when a printer fails *before* the job is spooled, so
-    a label is never sent to two printers.
+    Fallback only happens on PrintError, which the backends raise only when
+    the job definitely never reached the spooler. A job that may have been
+    submitted comes back as ``JobOutcome.UNCERTAIN`` and is never re-sent to a
+    second printer.
 
     Raises:
-        PrintError: if no printer is usable or every printer failed to spool.
+        PrintError: if no printer is usable or every printer definitely failed
+            to spool.
     """
     with attempt("print_to_first_available", image=describe_image(img)):
         discovery = discover()

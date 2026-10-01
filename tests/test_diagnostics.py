@@ -15,12 +15,19 @@ import ibp_printing
 from ibp_printing.diagnostics import (
     LABEL_SIZE,
     build_report,
+    describe_result,
     main,
     make_test_label,
     report_data,
 )
 from ibp_printing.discovery import discovery_from
-from ibp_printing.models import PrinterCandidate, PrintQueue, UsbDevice
+from ibp_printing.models import (
+    JobOutcome,
+    PrinterCandidate,
+    PrintQueue,
+    PrintResult,
+    UsbDevice,
+)
 
 GOOD = "DYMO LabelWriter 4XL 0922:0028"
 UNPLUGGED = "Zebra ZP450 0a5f:00d1"
@@ -126,6 +133,29 @@ class BuildReportTests(unittest.TestCase):
         self.assertIn("not used on this platform", report)
         self.assertIn("1. Canon", report)
 
+    def test_ghost_device_is_listed_but_not_usable(self):
+        ghost = UsbDevice(
+            device_id="USB\\VID_0922&PID_0028\\5&1",
+            name="DYMO ghost",
+            status="Error",
+            error_code=45,
+            vid_pid="0922:0028",
+            present=False,
+        )
+        report = build_report(discovery_from([PrintQueue(GOOD)], [ghost]))
+        self.assertIn(
+            "gate 2 (USB 0922:0028 present): NO (0 matching devices, 1 not connected)",
+            report,
+        )
+        self.assertIn("present=False", report)
+        self.assertIn("NOT CONNECTED: Present=False", report)
+        self.assertIn("usable label printers: 0", report)
+
+    def test_log_section_names_per_app_files(self):
+        report = build_report(discovery_from([], []), log_dir=Path("/x/logs"))
+        self.assertIn("printer-diag.log / printer-diag.jsonl", report)
+        self.assertIn("printer-watcher", report)
+
     def test_report_data_is_json(self):
         data = report_data(sample_discovery(), EVENTS, log_dir=Path("/x"))
         decoded = json.loads(json.dumps(data))
@@ -133,6 +163,22 @@ class BuildReportTests(unittest.TestCase):
         self.assertEqual(len(decoded["candidates"]), 3)
         self.assertEqual(decoded["errors"], ["something odd"])
         self.assertEqual(decoded["log_dir"], str(Path("/x")))
+
+
+class DescribeResultTests(unittest.TestCase):
+    """describe_result."""
+
+    def test_uncertain_and_tracking_failed_are_problems(self):
+        for outcome, text in (
+            (JobOutcome.UNCERTAIN, "may or may not have printed"),
+            (JobOutcome.TRACKING_FAILED, "following the job failed"),
+        ):
+            with self.subTest(outcome=outcome):
+                result = PrintResult("P", "J", outcome=outcome, history=["why"])
+                summary = describe_result(result, "")
+                self.assertIn(f"outcome={outcome.value} (PROBLEM: ", summary)
+                self.assertIn(text, summary)
+                self.assertIn("history: why", summary)
 
 
 class TestLabelTests(unittest.TestCase):
@@ -179,7 +225,7 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.backend.printed, [])
         for handler in logging.getLogger("ibp_printing").handlers:
             handler.flush()
-        logged = (self.log_dir / "printer.log").read_text(encoding="utf-8")
+        logged = (self.log_dir / "printer-diag.log").read_text(encoding="utf-8")
         self.assertIn("diagnostics report", logged)
         self.assertIn(f"1. {GOOD}", logged)
 

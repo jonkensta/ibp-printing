@@ -18,8 +18,10 @@ from ibp_printing.log import (
     configure_logging,
     current_attempt_id,
     describe_exception,
+    exception_summary,
     get_logger,
     log_event,
+    log_file_names,
 )
 
 
@@ -79,6 +81,26 @@ class JsonFormatterTests(CaptureMixin):
         self.assertEqual(record["msg"], "hello")
         self.assertEqual(record["data"], {"printer": "DYMO 0922:0028", "n": [1, 2]})
         self.assertRegex(record["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}$")
+
+    def test_data_may_use_parameter_names(self):
+        # PrintService events carry "level" and "message" keys (C1).
+        event = {"level": "2", "message": "failed", "logger": "x"}
+        log_event(self.logger, logging.INFO, "event", **event)
+        log_event(self.logger, logging.INFO, "nested", event=event)
+        flat, nested = (json.loads(line) for line in self.lines())
+        self.assertEqual(flat["level"], "INFO")
+        self.assertEqual(flat["data"], event)
+        self.assertEqual(nested["data"], {"event": event})
+
+    def test_nested_attempt_reuses_id(self):
+        with attempt("outer") as outer_id:
+            with attempt("inner", file="a.png") as inner_id:
+                self.assertEqual(inner_id, outer_id)
+                self.assertEqual(current_attempt_id(), outer_id)
+            self.assertEqual(current_attempt_id(), outer_id)
+        self.assertIsNone(current_attempt_id())
+        with attempt("next") as next_id:
+            self.assertNotEqual(next_id, outer_id)
 
     def test_no_attempt_no_data_and_unserializable_values(self):
         self.logger.info("plain")
@@ -141,18 +163,47 @@ class ConfigureLoggingTests(unittest.TestCase):
         log_event(get_logger("x"), logging.DEBUG, "detail", k="v")
         for handler in package_logger.handlers:
             handler.flush()
-        text = (self.log_dir / "printer.log").read_text(encoding="utf-8")
+        text = (self.log_dir / "printer-ibp-printing.log").read_text(encoding="utf-8")
         self.assertIn("logging configured", text)
         self.assertIn("detail | k=v", text)
         records = [
             json.loads(line)
-            for line in (self.log_dir / "printer.jsonl").read_text("utf-8").splitlines()
+            for line in (self.log_dir / "printer-ibp-printing.jsonl")
+            .read_text("utf-8")
+            .splitlines()
         ]
         self.assertEqual(records[-1]["data"], {"k": "v"})
         # Repeat calls return early without re-logging.
         self.assertEqual(
             sum(record["msg"] == "logging configured" for record in records), 1
         )
+
+    def test_per_app_files(self):
+        configure_logging(self.log_dir, app="watcher", console=False)
+        configure_logging(self.log_dir, app="shippy-gui", console=False)
+        configure_logging(self.log_dir, app="watcher", console=False)
+        package_logger = logging.getLogger("ibp_printing")
+        self.assertEqual(len(package_logger.handlers), 4)
+        for handler in package_logger.handlers:
+            handler.flush()
+        names = sorted(path.name for path in self.log_dir.iterdir())
+        self.assertEqual(
+            names,
+            [
+                "printer-shippy-gui.jsonl",
+                "printer-shippy-gui.log",
+                "printer-watcher.jsonl",
+                "printer-watcher.log",
+            ],
+        )
+
+    def test_log_file_names(self):
+        self.assertEqual(
+            log_file_names("diag"), ("printer-diag.log", "printer-diag.jsonl")
+        )
+        self.assertEqual(log_file_names(), log_file_names("ibp-printing"))
+        self.assertEqual(log_file_names("a/b c")[0], "printer-a-b-c.log")
+        self.assertEqual(log_file_names("..")[0], "printer-ibp-printing.log")
 
     def test_console_handler(self):
         stderr = io.StringIO()
@@ -187,7 +238,31 @@ class DescribeExceptionTests(unittest.TestCase):
 
     def test_plain_exception(self):
         details = describe_exception(RuntimeError("x"))
-        self.assertEqual(details, {"type": "RuntimeError", "repr": "RuntimeError('x')"})
+        self.assertEqual(
+            details, {"type": "RuntimeError", "repr": "RuntimeError('x')", "str": "x"}
+        )
+        self.assertEqual(exception_summary(RuntimeError("x")), "RuntimeError: x")
+
+    def test_wmi_error(self):
+        class FakeXWmi(Exception):
+            """Mimics wmi.x_wmi: info + com_error, custom __str__."""
+
+            def __init__(self, info="", com_error=None):
+                super().__init__()
+                self.info = info
+                self.com_error = com_error
+
+            def __str__(self):
+                return f"<x_wmi: {self.info} {self.com_error}>"
+
+        com_error = RuntimeError(-2147217392, "Exception occurred.", None, None)
+        details = describe_exception(FakeXWmi("Invalid class", com_error))
+        self.assertEqual(details["info"], "Invalid class")
+        self.assertEqual(details["com_error"], repr(com_error))
+        self.assertIn("Invalid class", details["str"])
+        summary = exception_summary(FakeXWmi("", com_error))
+        self.assertTrue(summary.startswith("FakeXWmi: <x_wmi:"), summary)
+        self.assertNotIn("info=", summary)
 
     def test_os_error_strerror(self):
         details = describe_exception(OSError(2, "No such file"))

@@ -31,8 +31,15 @@ from ibp_printing.log import (
     describe_exception,
     get_logger,
     log_event,
+    log_file_names,
 )
-from ibp_printing.models import Discovery, PrinterCandidate, PrintResult, UsbDevice
+from ibp_printing.models import (
+    Discovery,
+    JobOutcome,
+    PrinterCandidate,
+    PrintResult,
+    UsbDevice,
+)
 from ibp_printing.winconst import (
     PRINTER_ATTRIBUTE_BITS,
     PRINTER_STATUS_BITS,
@@ -46,6 +53,7 @@ LABEL_SIZE = (1200, 1800)  # 4x6 inches at 300 DPI
 LABEL_DPI = 300
 TEST_PRINT_TIMEOUT_S = 60.0
 NO_PRINTER_MESSAGE = "No label printer found plugged in."
+LOG_APP = "diag"
 
 
 # -- report ------------------------------------------------------------------
@@ -88,7 +96,13 @@ def build_report(
     lines.append("-- Logs --")
     lines.append(f"  {log_dir or default_log_dir()}")
     lines.append(
-        "  (printer.log is human-readable; printer.jsonl has one JSON per line)"
+        "  (one pair per app: printer-<app>.log is human-readable, "
+        "printer-<app>.jsonl has one JSON per line;"
+    )
+    lines.append(
+        f"   this tool writes {' / '.join(log_file_names(LOG_APP))}, the label "
+        "watcher printer-watcher.*, shippy printer-shippy.*, shippy-gui "
+        "printer-shippy-gui.*)"
     )
     return "\n".join(lines)
 
@@ -140,10 +154,13 @@ def _describe_candidate(index: int, candidate: PrinterCandidate) -> list[str]:
         )
     else:
         lines.append(f"        gate 1 (name ends in VID:PID): {candidate.vid_pid}")
-        present = "YES" if candidate.usb_devices else "NO"
+        connected = candidate.connected_devices
+        present = "YES" if connected else "NO"
+        ghosts = len(candidate.usb_devices) - len(connected)
         lines.append(
             f"        gate 2 (USB {candidate.vid_pid} present): {present}"
-            f" ({len(candidate.usb_devices)} matching devices)"
+            f" ({len(connected)} matching devices"
+            + (f", {ghosts} not connected)" if ghosts else ")")
         )
         for device in candidate.usb_devices:
             lines.append(f"          - {_describe_device(device)}")
@@ -160,10 +177,13 @@ def _describe_candidate(index: int, candidate: PrinterCandidate) -> list[str]:
 
 def _describe_device(device: UsbDevice) -> str:
     error_code = "-" if device.error_code is None else device.error_code
-    return (
+    present = "-" if device.present is None else device.present
+    text = (
         f"{device.name!r} status={device.status!r} error_code={error_code} "
-        f"class={device.pnp_class!r} id={device.device_id}"
+        f"present={present} class={device.pnp_class!r} id={device.device_id}"
     )
+    reason = device.absence_reason
+    return f"{text}  NOT CONNECTED: {reason}" if reason else text
 
 
 def _usb_section(devices: Sequence[UsbDevice]) -> list[str]:
@@ -323,12 +343,21 @@ def describe_result(result: Optional[PrintResult], error: str) -> str:
         "-- Test print --",
         f"  printer={result.printer_name!r}",
         f"  job_name={result.job_name!r} job_id={result.job_id}",
-        f"  outcome={result.outcome.value} "
-        f"({'label most likely printed' if result.outcome.ok else 'PROBLEM'})",
+        f"  outcome={result.outcome.value} ({_outcome_text(result)})",
         f"  elapsed={result.elapsed_s}s",
     ]
     lines += [f"  history: {entry}" for entry in result.history]
     return "\n".join(lines)
+
+
+def _outcome_text(result: PrintResult) -> str:
+    if result.outcome.ok:
+        return "label most likely printed"
+    if result.outcome is JobOutcome.UNCERTAIN:
+        return "PROBLEM: the label may or may not have printed; check the printer"
+    if result.outcome is JobOutcome.TRACKING_FAILED:
+        return "PROBLEM: spooled, but following the job failed; check the printer"
+    return "PROBLEM"
 
 
 # -- CLI -----------------------------------------------------------------------
@@ -340,7 +369,10 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         description="Explain which label printers are usable and why.",
     )
     parser.add_argument(
-        "--log-dir", type=Path, default=None, help="where to write printer.log/.jsonl"
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="where to write printer-diag.log/.jsonl",
     )
     parser.add_argument(
         "--events",
@@ -369,7 +401,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point for ``ibp-print-diag``. Returns the process exit code."""
     args = _parse_args(argv)
-    log_dir = configure_logging(args.log_dir, console=args.verbose)
+    log_dir = configure_logging(args.log_dir, app=LOG_APP, console=args.verbose)
 
     discovery = discover()
     events = (

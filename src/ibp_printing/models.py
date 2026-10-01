@@ -43,6 +43,12 @@ class PrintQueue:
         )
 
 
+# ConfigManagerErrorCode 45 (CM_PROB_PHANTOM): "Currently, this hardware device
+# is not connected to the computer." Windows keeps such ghost device nodes for
+# previously connected USB devices.
+CM_PROB_PHANTOM = 45
+
+
 @dataclass(frozen=True)
 class UsbDevice:
     """A USB Plug and Play entity as reported by WMI."""
@@ -53,11 +59,31 @@ class UsbDevice:
     error_code: Optional[int] = None
     pnp_class: str = ""
     vid_pid: Optional[str] = None
+    # Win32_PnPEntity.Present; None when WMI does not report it (pre-Windows 10).
+    present: Optional[bool] = None
+
+    @property
+    def connected(self) -> bool:
+        """False for ghost entries of devices that are not plugged in right now."""
+        return self.present is not False and self.error_code != CM_PROB_PHANTOM
+
+    @property
+    def absence_reason(self) -> Optional[str]:
+        """Why this entity does not count as plugged in, or None if it does."""
+        if self.present is False:
+            return "Present=False (Windows remembers it but it is not connected)"
+        if self.error_code == CM_PROB_PHANTOM:
+            return "error code 45 (device is not connected)"
+        return None
 
     @property
     def healthy(self) -> bool:
         """True when Windows reports the device as working normally."""
-        return self.status.lower() in {"", "ok"} and self.error_code in (None, 0)
+        return (
+            self.connected
+            and self.status.lower() in {"", "ok"}
+            and self.error_code in (None, 0)
+        )
 
 
 @dataclass(frozen=True)
@@ -76,18 +102,23 @@ class PrinterCandidate:
         return self.queue.name
 
     @property
+    def connected_devices(self) -> tuple[UsbDevice, ...]:
+        """Matching USB entities that are actually plugged in (not ghosts)."""
+        return tuple(device for device in self.usb_devices if device.connected)
+
+    @property
     def usable(self) -> bool:
         """True when the queue is a label printer whose USB device is present."""
         if not self.usb_matching:
             return True
-        return self.vid_pid is not None and bool(self.usb_devices)
+        return self.vid_pid is not None and bool(self.connected_devices)
 
     @property
     def device_healthy(self) -> bool:
-        """True when at least one matching USB device reports a healthy state."""
+        """True when at least one connected matching USB device is healthy."""
         if not self.usb_matching:
             return True
-        return any(device.healthy for device in self.usb_devices)
+        return any(device.healthy for device in self.connected_devices)
 
     def reasons(self) -> list[str]:
         """Human-readable explanation of each check for this queue."""
@@ -97,7 +128,20 @@ class PrinterCandidate:
             return ["name does not end in a VID:PID suffix like ' 0922:0028'"]
         if not self.usb_devices:
             return [f"no USB device with VID:PID {self.vid_pid} is present"]
-        reasons = [f"USB {self.vid_pid} present ({len(self.usb_devices)} entities)"]
+        ghosts = [
+            f"{device.device_id}: {device.absence_reason}"
+            for device in self.usb_devices
+            if not device.connected
+        ]
+        if not self.connected_devices:
+            return [
+                f"USB {self.vid_pid} is known to Windows but not connected "
+                f"({len(ghosts)} ghost entities)"
+            ] + [f"not connected: {ghost}" for ghost in ghosts]
+        reasons = [
+            f"USB {self.vid_pid} present ({len(self.connected_devices)} entities)"
+        ]
+        reasons += [f"ignored, not connected: {ghost}" for ghost in ghosts]
         if not self.device_healthy:
             reasons.append("USB device reports a non-OK status or error code")
         if self.queue.has_problem:
@@ -108,10 +152,15 @@ class PrinterCandidate:
         return reasons
 
     def rank_key(self) -> tuple[bool, bool, bool, str]:
-        """Sort key: healthy, problem-free, default queues first."""
+        """Sort key: healthy device, then problem-free queue, then default first.
+
+        Device health ranks above the queue's problem flags: a queue flag such
+        as OFFLINE often clears by itself once a job is sent to a working
+        device, while a device Windows reports as broken will not print.
+        """
         return (
-            self.queue.has_problem,
             not self.device_healthy,
+            self.queue.has_problem,
             not self.queue.is_default,
             self.name,
         )
@@ -174,10 +223,19 @@ class JobOutcome(str, Enum):
     DELETED = "deleted"
     TIMEOUT = "timeout"
     NOT_TRACKED = "not_tracked"
+    # A failure after StartDoc: the job may or may not have reached the printer.
+    UNCERTAIN = "uncertain"
+    # The job was spooled, but following it in the queue raised.
+    TRACKING_FAILED = "tracking_failed"
 
     @property
     def ok(self) -> bool:
-        """True for outcomes that most likely produced a label."""
+        """True for outcomes that most likely produced a label.
+
+        Every other outcome means "the label may not have printed, and may
+        still print later": check the printer before reprinting, and never
+        refund or send it to a second printer automatically.
+        """
         return self in {
             JobOutcome.COMPLETED,
             JobOutcome.VANISHED_UNSEEN,

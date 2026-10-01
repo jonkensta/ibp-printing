@@ -141,5 +141,22 @@ class TrackJobTests(unittest.TestCase):
         self.assertEqual(outcome, JobOutcome.TIMEOUT)
 
 
+class JobOutcomeTests(unittest.TestCase):
+    """JobOutcome.ok."""
+
+    def test_ok_outcomes(self):
+        ok = {outcome for outcome in JobOutcome if outcome.ok}
+        self.assertEqual(
+            ok,
+            {
+                JobOutcome.COMPLETED,
+                JobOutcome.VANISHED_UNSEEN,
+                JobOutcome.NOT_TRACKED,
+            },
+        )
+        self.assertEqual(JobOutcome.UNCERTAIN.value, "uncertain")
+        self.assertEqual(JobOutcome.TRACKING_FAILED.value, "tracking_failed")
+
+
 if __name__ == "__main__":
     unittest.main()

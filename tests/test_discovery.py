@@ -1,6 +1,7 @@
 """Tests for queue-name / device-id matching and candidate ranking."""
 
 import unittest
+from typing import Optional
 
 from ibp_printing.discovery import (
     build_candidates,
@@ -14,7 +15,12 @@ from ibp_printing.winconst import PRINTER_ATTRIBUTE_WORK_OFFLINE
 DYMO = "0922:0028"
 
 
-def usb(vid_pid: str = DYMO, status: str = "OK", error_code: int = 0) -> UsbDevice:
+def usb(
+    vid_pid: str = DYMO,
+    status: str = "OK",
+    error_code: int = 0,
+    present: Optional[bool] = True,
+) -> UsbDevice:
     """A WMI-like USB device for VID:PID ``vid_pid``."""
     vid, pid = vid_pid.split(":")
     return UsbDevice(
@@ -24,6 +30,7 @@ def usb(vid_pid: str = DYMO, status: str = "OK", error_code: int = 0) -> UsbDevi
         error_code=error_code,
         pnp_class="USB",
         vid_pid=vid_pid,
+        present=present,
     )
 
 
@@ -154,11 +161,59 @@ class CandidateTests(unittest.TestCase):
             [
                 "D default 0922:002A",
                 "C ok 0922:0029",
-                "B sick 0922:0020",
+                # Device health ranks above queue problem flags.
                 "A problem 0922:0028",
+                "B sick 0922:0020",
             ],
         )
         self.assertEqual(discovery.errors, ["boom"])
+
+    def test_ghost_device_not_present_is_not_usable(self):
+        (candidate,) = build_candidates(
+            [PrintQueue("DYMO 0922:0028")], [usb(present=False)]
+        )
+        self.assertFalse(candidate.usable)
+        self.assertEqual(len(candidate.usb_devices), 1)  # still listed
+        self.assertEqual(candidate.connected_devices, ())
+        reasons = " | ".join(candidate.reasons())
+        self.assertIn("not connected", reasons)
+        self.assertIn("Present=False", reasons)
+
+    def test_error_code_45_is_not_usable(self):
+        ghost = usb(status="Error", error_code=45, present=None)
+        self.assertFalse(ghost.connected)
+        self.assertFalse(ghost.healthy)
+        (candidate,) = build_candidates([PrintQueue("DYMO 0922:0028")], [ghost])
+        self.assertFalse(candidate.usable)
+        self.assertIn("error code 45", " | ".join(candidate.reasons()))
+
+    def test_present_unknown_counts_as_present(self):
+        # Win32_PnPEntity.Present is missing before Windows 10.
+        (candidate,) = build_candidates(
+            [PrintQueue("DYMO 0922:0028")], [usb(present=None)]
+        )
+        self.assertTrue(candidate.usable)
+        self.assertTrue(candidate.device_healthy)
+
+    def test_ghost_plus_real_device_is_usable_and_ghost_ignored(self):
+        (candidate,) = build_candidates(
+            [PrintQueue("DYMO 0922:0028")],
+            [usb(present=False), usb(error_code=45), usb()],
+        )
+        self.assertTrue(candidate.usable)
+        self.assertEqual(len(candidate.connected_devices), 1)
+        reasons = candidate.reasons()
+        self.assertEqual(reasons[0], f"USB {DYMO} present (1 entities)")
+        self.assertEqual(sum("ignored, not connected" in r for r in reasons), 2)
+
+    def test_ghost_does_not_make_device_healthy(self):
+        candidate = PrinterCandidate(
+            PrintQueue("DYMO 0922:0028"),
+            DYMO,
+            (usb(status="Error", error_code=10), usb(present=False)),
+        )
+        self.assertTrue(candidate.usable)
+        self.assertFalse(candidate.device_healthy)
 
     def test_healthy_if_any_matching_device_is_healthy(self):
         candidate = PrinterCandidate(

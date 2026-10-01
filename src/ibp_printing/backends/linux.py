@@ -10,7 +10,13 @@ from PIL import Image
 
 from ibp_printing.backends.base import PrinterBackend, PrintError
 from ibp_printing.log import describe_exception, get_logger, log_event, timed_step
-from ibp_printing.models import Discovery, PrinterCandidate, PrintQueue, PrintResult
+from ibp_printing.models import (
+    Discovery,
+    JobOutcome,
+    PrinterCandidate,
+    PrintQueue,
+    PrintResult,
+)
 from ibp_printing.render import PRINT_SCALE_FACTOR, flatten_for_print, orient_portrait
 
 logger = get_logger(__name__)
@@ -135,6 +141,13 @@ class LinuxPrinterBackend(PrinterBackend):
             )
             if proc.returncode != 0:
                 raise PrintError(f"Print command failed: {proc.stderr.strip()}")
+        except subprocess.TimeoutExpired as exc:
+            # lp may have queued the job before hanging: not a definite failure.
+            result.outcome = JobOutcome.UNCERTAIN
+            result.history.append(f"lp timed out after {exc.timeout}s")
+            log_event(
+                logger, logging.ERROR, "lp timed out", error=describe_exception(exc)
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             log_event(logger, logging.ERROR, "lp failed", error=describe_exception(exc))
             raise PrintError(f"Print command failed: {exc}") from exc

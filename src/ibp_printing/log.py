@@ -1,9 +1,10 @@
 """Verbose, structured logging for printer troubleshooting.
 
-Two files are written side by side in the log directory:
+Two files are written side by side in the log directory, one pair per
+application so separate processes never share (and fight over rotating) a file:
 
-* ``printer.log``   - human-readable lines, ``key=value`` data appended.
-* ``printer.jsonl`` - one JSON object per line, for grepping or loading later.
+* ``printer-<app>.log``   - human-readable lines, ``key=value`` data appended.
+* ``printer-<app>.jsonl`` - one JSON object per line, for grepping or loading later.
 
 Every record carries the host name, process ID, thread name, and the current
 print attempt ID (if any), so one failed label can be followed end to end.
@@ -14,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -28,11 +30,13 @@ LOGGER_NAME = "ibp_printing"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 20
 HOSTNAME = socket.gethostname()
+DEFAULT_APP = "ibp-printing"
+_APP_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 _ATTEMPT_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "ibp_printing_attempt_id", default=None
 )
-_CONFIGURED_DIRS: set[Path] = set()
+_CONFIGURED_DIRS: set[tuple[Path, str]] = set()
 _CONFIGURE_LOCK = threading.Lock()
 
 
@@ -43,8 +47,12 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"{LOGGER_NAME}.{name}")
 
 
-def log_event(logger: logging.Logger, level: int, message: str, **data: Any) -> None:
-    """Log ``message`` with structured ``data`` attached."""
+def log_event(logger: logging.Logger, level: int, message: str, /, **data: Any) -> None:
+    """Log ``message`` with structured ``data`` attached.
+
+    The first three parameters are positional-only, so ``data`` may itself
+    contain keys named ``logger``, ``level`` or ``message``.
+    """
     logger.log(level, message, extra={"data": data}, stacklevel=2)
 
 
@@ -55,11 +63,19 @@ def current_attempt_id() -> Optional[str]:
 
 @contextlib.contextmanager
 def attempt(label: str, **data: Any) -> Iterator[str]:
-    """Tag every record logged inside the block with a fresh attempt ID."""
-    attempt_id = uuid.uuid4().hex[:10]
+    """Tag every record logged inside the block with an attempt ID.
+
+    A fresh ID is minted for the outermost block. A nested block (for example
+    ``print_image`` called by the label watcher's per-file attempt) reuses the
+    active ID, so one ID covers the whole story, including the spooler job name.
+    """
+    outer_id = _ATTEMPT_ID.get()
+    attempt_id = outer_id or uuid.uuid4().hex[:10]
     token = _ATTEMPT_ID.set(attempt_id)
     logger = get_logger("attempt")
     started = time.monotonic()
+    if outer_id is not None:
+        data = {**data, "nested": True}
     log_event(logger, logging.INFO, f"BEGIN {label}", **data)
     try:
         yield attempt_id
@@ -106,15 +122,49 @@ def timed_step(logger: logging.Logger, step: str, **data: Any) -> Iterator[None]
     )
 
 
+_EXCEPTION_ATTRS = (
+    # pywintypes.error and com_error.
+    "winerror",
+    "funcname",
+    "strerror",
+    "hresult",
+    "excepinfo",
+    # wmi.x_wmi (and its subclasses) wrap the underlying com_error.
+    "info",
+    "com_error",
+)
+
+
 def describe_exception(exc: BaseException) -> dict[str, Any]:
-    """Extract the useful fields from an exception, including pywin32 errors."""
+    """Extract the useful fields from an exception, including pywin32/WMI errors."""
     details: dict[str, Any] = {"type": type(exc).__name__, "repr": repr(exc)}
-    # pywintypes.error and com_error expose winerror/funcname/strerror.
-    for attr in ("winerror", "funcname", "strerror", "hresult", "excepinfo"):
-        value = getattr(exc, attr, None)
-        if value is not None:
-            details[attr] = value if isinstance(value, (int, str)) else repr(value)
+    try:
+        text = str(exc)
+    except Exception:  # pylint: disable=broad-exception-caught
+        text = ""
+    if text:
+        details["str"] = text
+    for attr in _EXCEPTION_ATTRS:
+        try:
+            value = getattr(exc, attr, None)
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        if value is None or value == "":
+            continue
+        details[attr] = value if isinstance(value, (int, str)) else repr(value)
     return details
+
+
+def exception_summary(exc: BaseException) -> str:
+    """One line for an error list: ``Type: text (winerror=..., ...)``."""
+    details = describe_exception(exc)
+    head = f"{details['type']}: {details.get('str') or details['repr']}"
+    extras = [
+        f"{key}={details[key]}"
+        for key in _EXCEPTION_ATTRS
+        if key in details and str(details[key]) not in head
+    ]
+    return f"{head} ({', '.join(extras)})" if extras else head
 
 
 def add_context(record: logging.LogRecord) -> bool:
@@ -182,32 +232,49 @@ def default_log_dir() -> Path:
     return Path(base) / "ibp-printing" / "logs"
 
 
+def log_file_names(app: str = DEFAULT_APP) -> tuple[str, str]:
+    """The ``(text, json)`` log file names used for ``app``."""
+    safe = _APP_NAME_PATTERN.sub("-", app).strip("-.") or DEFAULT_APP
+    return f"printer-{safe}.log", f"printer-{safe}.jsonl"
+
+
 def configure_logging(
-    log_dir: Optional[Path] = None, *, console: bool = True, level: int = logging.DEBUG
+    log_dir: Optional[Path] = None,
+    *,
+    app: str = DEFAULT_APP,
+    console: bool = True,
+    level: int = logging.DEBUG,
 ) -> Path:
     """Attach the text and JSON file handlers to the package logger.
 
+    Each application writes its own pair of files, ``printer-<app>.log`` and
+    ``printer-<app>.jsonl`` (shippy uses ``app="shippy"``, the label watcher
+    ``app="watcher"``, ``ibp-print-diag`` ``app="diag"``). Separate processes
+    must never share a rotating file: on Windows one process's open handle
+    stops another from rotating it.
+
     Safe to call more than once; handlers are only added the first time for a
-    given directory. Records still propagate to the root logger, so a host
-    application's own log file also receives them.
+    given directory and app. Records still propagate to the root logger, so a
+    host application's own log file also receives them.
 
     Returns:
         The directory logs are written to.
     """
     log_dir = Path(log_dir) if log_dir else default_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
+    text_name, json_name = log_file_names(app)
 
     package_logger = logging.getLogger(LOGGER_NAME)
     package_logger.setLevel(level)
 
     with _CONFIGURE_LOCK:
-        if log_dir in _CONFIGURED_DIRS:
+        if (log_dir, text_name) in _CONFIGURED_DIRS:
             return log_dir
-        _CONFIGURED_DIRS.add(log_dir)
+        _CONFIGURED_DIRS.add((log_dir, text_name))
 
         for filename, formatter in (
-            ("printer.log", HumanFormatter()),
-            ("printer.jsonl", JsonFormatter()),
+            (text_name, HumanFormatter()),
+            (json_name, JsonFormatter()),
         ):
             handler = RotatingFileHandler(
                 log_dir / filename,
@@ -220,7 +287,12 @@ def configure_logging(
             package_logger.addHandler(handler)
 
         # pythonw.exe has no stderr; a StreamHandler would fail on every record.
-        if console and sys.stderr is not None:
+        has_console = any(
+            isinstance(existing, logging.StreamHandler)
+            and not hasattr(existing, "baseFilename")
+            for existing in package_logger.handlers
+        )
+        if console and sys.stderr is not None and not has_console:
             stream = logging.StreamHandler()
             stream.setLevel(logging.INFO)
             stream.setFormatter(HumanFormatter())
@@ -232,6 +304,8 @@ def configure_logging(
         logging.INFO,
         "logging configured",
         log_dir=str(log_dir),
+        app=app,
+        files=[text_name, json_name],
         python=sys.version.split()[0],
         executable=sys.executable,
         platform=sys.platform,

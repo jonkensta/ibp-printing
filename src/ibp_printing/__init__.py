@@ -10,7 +10,7 @@ from ibp_printing.api import (
     set_backend,
 )
 from ibp_printing.backends import PrinterBackend, PrintError
-from ibp_printing.log import configure_logging, default_log_dir
+from ibp_printing.log import configure_logging, default_log_dir, log_file_names
 from ibp_printing.paths import downloads_dir, save_for_retry, to_print_dir
 from ibp_printing.models import (
     Discovery,
@@ -37,6 +37,7 @@ __all__ = [
     "find_label_printers",
     "get_backend",
     "get_default_printer",
+    "log_file_names",
     "print_image",
     "print_to_first_available",
     "save_for_retry",

@@ -59,11 +59,13 @@ class FakeBackend(PrinterBackend):
         devices: list[UsbDevice],
         fail: Optional[dict[str, BaseException]] = None,
         events: Optional[list[dict]] = None,
+        outcomes: Optional[dict[str, JobOutcome]] = None,
     ) -> None:
         self.queues = queues
         self.devices = devices
         self.fail = fail or {}
         self.events = events or []
+        self.outcomes = outcomes or {}
         self.printed: list[tuple[str, str, float]] = []
 
     def discover(self) -> Discovery:
@@ -83,11 +85,12 @@ class FakeBackend(PrinterBackend):
         self.printed.append((printer_name, job_name, track_timeout_s))
         if printer_name in self.fail:
             raise self.fail[printer_name]
+        default = JobOutcome.COMPLETED if track_timeout_s else JobOutcome.NOT_TRACKED
         return PrintResult(
             printer_name=printer_name,
             job_name=job_name,
             job_id=7,
-            outcome=JobOutcome.COMPLETED if track_timeout_s else JobOutcome.NOT_TRACKED,
+            outcome=self.outcomes.get(printer_name, default),
         )
 
     def recent_print_events(self, minutes: int = 15, max_events: int = 40):

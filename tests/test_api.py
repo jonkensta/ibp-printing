@@ -7,6 +7,7 @@ from printing_helpers import FakeBackend, dymo, quiet_logging
 
 import ibp_printing
 from ibp_printing import PrintError, PrintQueue
+from ibp_printing.log import attempt
 from ibp_printing.models import JobOutcome
 
 FIRST = "A DYMO 0922:0028"
@@ -48,6 +49,24 @@ class ApiTests(unittest.TestCase):
         result = ibp_printing.print_to_first_available(self.img)
         self.assertEqual(result.printer_name, SECOND)
         self.assertEqual([call[0] for call in backend.printed], [FIRST, SECOND])
+
+    def test_does_not_fall_back_on_uncertain_or_failed_tracking(self):
+        for outcome in (JobOutcome.UNCERTAIN, JobOutcome.TRACKING_FAILED):
+            with self.subTest(outcome=outcome):
+                backend = self.two_printers(outcomes={FIRST: outcome})
+                result = ibp_printing.print_to_first_available(self.img)
+                self.assertEqual(result.outcome, outcome)
+                self.assertFalse(result.outcome.ok)
+                self.assertEqual([call[0] for call in backend.printed], [FIRST])
+
+    def test_nested_attempt_id_is_reused_in_job_name(self):
+        backend = self.two_printers()
+        with attempt("watcher file", file="label.png") as outer_id:
+            ibp_printing.print_image(self.img, FIRST, job_name="Label")
+            ibp_printing.print_to_first_available(self.img, job_name="Label")
+        self.assertEqual(
+            [call[1] for call in backend.printed], [f"Label [{outer_id}]"] * 2
+        )
 
     def test_does_not_fall_back_on_unexpected_errors(self):
         backend = self.two_printers(fail={FIRST: ValueError("bug")})

@@ -3,7 +3,9 @@
 A print queue is a label printer when its name ends in a ``VID:PID`` suffix
 (for example ``"DYMO LabelWriter 450 0922:0020"``), separated from the rest of
 the name by whitespace, ``_`` or ``-``. It is usable when a USB device with that
-VID:PID is currently present. Device health and queue status only affect the
+VID:PID is currently present: ghost entries Windows keeps for unplugged devices
+(``Present`` false, or ConfigManagerErrorCode 45) do not count, though they are
+still listed in diagnostics. Device health and queue status only affect the
 ranking, never visibility, so a misbehaving printer still shows up in the logs.
 """
 

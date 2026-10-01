@@ -10,7 +10,12 @@ from ibp_printing.models import Discovery, PrintResult
 
 
 class PrintError(RuntimeError):
-    """Raised when an image could not be handed to the spooler."""
+    """Raised only when the job definitely never reached the spooler.
+
+    It is safe to retry (or send to another printer) after a PrintError. A
+    failure that may have left a job behind is reported as a PrintResult with
+    ``JobOutcome.UNCERTAIN`` instead.
+    """
 
 
 class PrinterBackend(ABC):
@@ -42,7 +47,8 @@ class PrinterBackend(ABC):
                 many seconds and record how it ended in the result.
 
         Raises:
-            PrintError: If the job could not be spooled.
+            PrintError: Only if the job definitely never reached the spooler;
+                a possible partial submission returns ``JobOutcome.UNCERTAIN``.
         """
 
     def recent_print_events(

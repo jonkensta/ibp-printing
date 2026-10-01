@@ -11,7 +11,8 @@ Both apps buy EasyPost postage and print a 4x6 label on a USB label printer
 - **discovers** label printers by matching each print queue to a plugged-in USB
   device by VID:PID;
 - **prints** a PIL image through the Windows spooler and GDI (CUPS on Linux),
-  falling back to the next printer if one fails *before* the job is spooled;
+  falling back to the next printer only if one *definitely* never received the
+  job;
 - **tracks** the spooled job until it prints, errors, is deleted, or times out;
 - **logs everything** (queues, USB devices, every GDI step, job status changes,
   PrintService events) to a human-readable log and a JSON-lines log, so a
@@ -46,10 +47,19 @@ Zebra ZP450-0A5F:00D1
 ```
 
 Hex digits may be upper or lower case. The queue is **usable** when a USB
-device with that VID:PID is currently plugged in. If the device reports an
-error or the queue is paused or offline, the printer stays usable but is ranked
-lower. Healthy printers are tried first, then the Windows default, then
-alphabetical order.
+device with that VID:PID is currently plugged in. Windows remembers devices
+that were plugged in before; those ghost entries (WMI `Win32_PnPEntity.Present`
+false, or `ConfigManagerErrorCode` 45, "not connected") do **not** count as
+plugged in. `ibp-print-diag` still lists them, marked `NOT CONNECTED`, so you
+can see why a queue is not usable. If a connected device reports an error or
+the queue is paused or offline, the printer stays usable but is ranked lower:
+printers whose USB device is healthy come first, then queues without a problem
+flag, then the Windows default, then alphabetical order.
+
+Only **local** print queues are considered (`EnumPrinters` with
+`PRINTER_ENUM_LOCAL`). USB label printers are always local queues; network
+printer *connections* are skipped because enumerating them can stall for a long
+time when a print server is unreachable.
 
 ### Setting it up on Windows
 
@@ -74,7 +84,7 @@ Everything is importable from `ibp_printing`:
 from PIL import Image
 import ibp_printing
 
-ibp_printing.configure_logging()          # once, at startup (see Logs below)
+ibp_printing.configure_logging(app="shippy")   # once, at startup (see Logs below)
 
 label = Image.open("label.png")
 
@@ -88,7 +98,8 @@ result = ibp_printing.print_image(label, "DYMO LabelWriter 4XL 0922:0028",
                                   track_timeout_s=60)
 print(result.printer_name, result.outcome, result.history)
 if not result.outcome.ok:
-    ...  # JobOutcome.ERROR / DELETED / TIMEOUT: the label probably didn't print
+    ...  # The label may not have printed, and may still print later:
+         # tell the user to check the printer. Don't refund or resend.
 
 # Discovery
 for candidate in ibp_printing.find_label_printers():   # usable, best first
@@ -100,23 +111,40 @@ ibp_printing.get_default_printer()      # OS default queue name, or None
 
 | Name | What it is |
 |------|------------|
-| `print_to_first_available(img, *, job_name=None, track_timeout_s=0.0)` | Print to the best usable printer, trying the next one only if a printer fails before the job is spooled, so a label is never printed twice. |
+| `print_to_first_available(img, *, job_name=None, track_timeout_s=0.0)` | Print to the best usable printer, trying the next one only on `PrintError` (the job definitely never reached that printer's spooler), so a label is never sent to two printers. |
 | `print_image(img, printer_name, *, job_name=None, track_timeout_s=0.0)` | Print to one named queue. |
 | `discover()` | Returns a `Discovery` with `queues`, `usb_devices`, `candidates`, `errors`, and the ranked `.usable` list. |
 | `find_label_printers()` | `discover().usable`. |
 | `get_default_printer()` | The OS default printer name. |
-| `configure_logging(log_dir=None, *, console=True, level=DEBUG)` | Attach the file handlers. It's safe to call more than once and returns the log directory. |
+| `configure_logging(log_dir=None, *, app="ibp-printing", console=True, level=DEBUG)` | Attach the file handlers for `printer-<app>.log` / `printer-<app>.jsonl`. It's safe to call more than once and returns the log directory. |
 | `default_log_dir()` | Where logs go by default. |
-| `PrintError` | Raised when nothing could be spooled. Subclass of `RuntimeError`. |
+| `PrintError` | Raised **only** when the job definitely never reached the spooler (no printer, CreateDC/CreatePrinterDC/StartDoc failed, or a later failure where AbortDoc returned and the queue holds no job with our attempt ID). Safe to retry. Subclass of `RuntimeError`. |
 | `PrintResult` | `printer_name`, `job_name`, `job_id`, `outcome`, `history`, `elapsed_s`. |
-| `JobOutcome` | `COMPLETED`, `VANISHED_UNSEEN`, `ERROR`, `DELETED`, `TIMEOUT`, `NOT_TRACKED`. `.ok` is true when a label most likely came out. |
+| `JobOutcome` | See [Outcomes](#outcomes). `.ok` is true when a label most likely came out. |
 | `PrinterCandidate`, `PrintQueue`, `UsbDevice` | Discovery records. `candidate.reasons()` explains each check. |
 | `get_backend()` / `set_backend(backend)` | Access or replace the platform backend (`PrinterBackend`), for example with a fake in tests. |
 
 With `track_timeout_s > 0` the Windows backend polls the spooler for the job
-(found by its document name, which includes a unique attempt ID) and records
-each status change in `result.history`. A successful `EndDoc` only means the
-spooler accepted the job. Tracking shows whether it actually printed.
+(found by the unique `[attempt-id]` at the end of its document name) and
+records each status change in `result.history`. A successful `EndDoc` only
+means the spooler accepted the job. Tracking shows whether it actually printed.
+
+### Outcomes
+
+| `JobOutcome` | `.ok` | Meaning |
+|---|---|---|
+| `COMPLETED` | yes | The spooler reported the job printed, or it left the queue normally. |
+| `VANISHED_UNSEEN` | yes | The job was never seen in the queue (usually printed before the first poll). The queue contents are logged. |
+| `NOT_TRACKED` | yes | Spooled; tracking was not requested (`track_timeout_s=0`). |
+| `ERROR` | no | The job sat in an error state (paper out, offline, ...) for 10 s. It may still print once fixed. |
+| `DELETED` | no | The job was deleted from the queue. |
+| `TIMEOUT` | no | Still queued when tracking gave up. It may still print. |
+| `TRACKING_FAILED` | no | Spooled, but following the job raised. History keeps what was seen. |
+| `UNCERTAIN` | no | A GDI call failed after `StartDoc` and the library could not rule out that part or all of the job reached the printer (`EndDoc` failed, `AbortDoc` raised, the job is still in the queue, or the queue could not be checked). `history` says which. |
+
+Every non-ok outcome means "the label may or may not come out": tell the user
+to check the printer before reprinting. Never refund or resend automatically;
+`print_to_first_available` never sends such a job to a second printer.
 
 ## Diagnostics CLI
 
@@ -152,19 +180,34 @@ the same report as a string.
 
 Logs are written to `%LOCALAPPDATA%\ibp-printing\logs` on Windows
 (`$XDG_STATE_HOME/ibp-printing/logs`, or `~/.local/state/ibp-printing/logs`
-elsewhere):
+elsewhere). Each application writes its **own** pair of files, named by the
+`app` passed to `configure_logging`:
 
-- `printer.log`: human-readable lines:
+| App | Files |
+|---|---|
+| shippy | `printer-shippy.log`, `printer-shippy.jsonl` |
+| shippy-gui | `printer-shippy-gui.log`, `printer-shippy-gui.jsonl` |
+| label watcher | `printer-watcher.log`, `printer-watcher.jsonl` |
+| `ibp-print-diag` | `printer-diag.log`, `printer-diag.jsonl` |
+| anything else (default) | `printer-ibp-printing.log`, `printer-ibp-printing.jsonl` |
+
+Separate files matter on Windows: a process cannot rotate a log file another
+process holds open, so sharing one rotating file between the watcher and an
+app would stop rotation and lose records.
+
+- `printer-<app>.log`: human-readable lines:
   `time LEVEL [attempt-id] thread logger: message | key=value ...`
-- `printer.jsonl`: one JSON object per line with `ts`, `level`, `logger`,
+- `printer-<app>.jsonl`: one JSON object per line with `ts`, `level`, `logger`,
   `host`, `pid`, `thread`, `attempt_id`, `msg`, an optional `data` object, and
   `exc` for exceptions.
 
 Both rotate at 5 MB and keep 20 backups. Every print call gets an **attempt ID**
 that tags all of its log records and is added to the spooler document name
-(`Shipping Label [3f9c0a1b2e]`). That lets you follow one label from discovery
-through each GDI call to the spooler's final job status. Records also propagate
-to the root logger, so the host app's own log receives them too.
+(`Shipping Label [3f9c0a1b2e]`). Nested attempts reuse the outer ID, so when the
+label watcher prints a file, the file's whole story and the spooler job share
+one ID. That lets you follow one label from discovery through each GDI call to
+the spooler's final job status. Records also propagate to the root logger, so
+the host app's own log receives them too.
 
 ## Label watcher
 
