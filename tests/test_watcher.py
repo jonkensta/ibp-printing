@@ -733,6 +733,8 @@ class InstanceTests(TempDirTest):
         self.assertTrue(first.acquire())
         self.assertFalse(SingleInstance(lock).acquire())
         first.release()
+        # The holder's pid was written despite the byte-range lock (Windows).
+        self.assertEqual(lock.read_text("utf-8"), f"pid={os.getpid()}\n")
         again = SingleInstance(lock)
         self.assertTrue(again.acquire())
         again.release()
