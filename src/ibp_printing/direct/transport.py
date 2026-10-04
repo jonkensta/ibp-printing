@@ -158,6 +158,12 @@ class DirectDevice:
     ``\\\\?\\usb#vid_...`` interface path). ``vid_pid`` is upper-case
     ``"2E3C:5760"`` (empty if unknown). ``model`` is the 1284 ``MDL`` unless
     given explicitly. ``kind`` is ``"usblp"``, ``"usbprint"`` or ``"fake"``.
+    ``present`` is False when the device node is missing (Linux sysfs lists
+    the device but ``/dev/usb/lpN`` does not exist). ``accessible`` is whether
+    this user can open it read-write: True/False when known (Linux: file
+    permissions; Windows: the 1284 ID query's open succeeded), None if unknown.
+    ``busy`` is True when discovery's open failed because something else had
+    the device open (Windows spooler or another program).
     """
 
     path: str
@@ -170,6 +176,9 @@ class DirectDevice:
     manufacturer: str = ""
     product: str = ""
     errors: list[str] = field(default_factory=list)
+    present: bool = True
+    accessible: Optional[bool] = None
+    busy: bool = False
 
     def __post_init__(self) -> None:
         if self.ieee1284_raw and not self.ieee1284:
@@ -189,6 +198,9 @@ class DirectDevice:
             "manufacturer": self.manufacturer,
             "product": self.product,
             "ieee1284": self.ieee1284_raw or self.ieee1284,
+            "present": self.present,
+            "accessible": self.accessible,
+            "busy": self.busy,
             "errors": self.errors,
         }
 
@@ -684,6 +696,8 @@ def _linux_device(entry: Path, dev_root: Path) -> DirectDevice:
         access = os.access(node, os.R_OK | os.W_OK)
     else:
         errors.append(f"{node} does not exist")
+        device.present = False
+    device.accessible = access
     log_event(
         logger,
         logging.INFO,
@@ -748,6 +762,19 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
+
+# Share mode for opening the printer: 0 = exclusive. While we hold the handle
+# nobody else - in particular the Windows spooler's USB port monitor, which
+# opens the same usbprint.sys interface for each job it sends - can open the
+# device, so no other program's bytes can be interleaved into our job (the
+# printer would read them as bitmap data). Sharing (FILE_SHARE_READ |
+# FILE_SHARE_WRITE) would buy nothing: our reads use our own handle, and the
+# share mode only governs *other* opens. The cost is that our open fails with
+# ERROR_SHARING_VIOLATION (reason "busy") while anything else has the device
+# open, e.g. the spooler is printing to it; the caller treats that as "not
+# sent" and falls back. A spooler job that arrives while we print waits in
+# the queue (port error / retry) and prints after we close.
+USBPRINT_SHARE_MODE = 0
 FILE_FLAG_OVERLAPPED = 0x40000000
 WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
@@ -885,7 +912,10 @@ class Win32Api(abc.ABC):
 
     @abc.abstractmethod
     def create_file(self, path: str) -> Optional[int]:
-        """``CreateFileW`` read/write, shared, overlapped; None on failure."""
+        """``CreateFileW`` read/write, exclusive, overlapped; None on failure.
+
+        See :data:`USBPRINT_SHARE_MODE` for why the handle is exclusive.
+        """
 
     @abc.abstractmethod
     def create_event(self) -> Optional[int]:
@@ -1135,7 +1165,7 @@ class CtypesWin32Api(Win32Api):
             self._create_file(
                 path,
                 GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                USBPRINT_SHARE_MODE,
                 None,
                 OPEN_EXISTING,
                 FILE_FLAG_OVERLAPPED,
@@ -1584,9 +1614,16 @@ def discover_windows_usbprint(api: Optional[Win32Api] = None) -> list[DirectDevi
         vid_pid, serial = parse_usbprint_path(path)
         errors: list[str] = []
         raw = ""
+        accessible: Optional[bool] = None
+        busy = False
         try:
             with WindowsUsbprintTransport(path, api=api) as transport:
+                accessible = True
                 raw = transport.get_1284_id()
+        except DeviceUnavailable as exc:
+            errors.append(str(exc))
+            busy = exc.reason == "busy"
+            accessible = None if busy else False
         except TransportError as exc:
             errors.append(str(exc))
         device = DirectDevice(
@@ -1596,6 +1633,8 @@ def discover_windows_usbprint(api: Optional[Win32Api] = None) -> list[DirectDevi
             ieee1284_raw=raw,
             kind="usbprint",
             errors=errors,
+            accessible=accessible,
+            busy=busy,
         )
         log_event(logger, logging.INFO, "usbprint device", **device.to_log())
         devices.append(device)

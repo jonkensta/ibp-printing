@@ -364,6 +364,9 @@ class LinuxDiscoveryTests(unittest.TestCase):
         self.assertEqual(device.product, "PM2411BT")
         self.assertEqual(device.kind, "usblp")
         self.assertEqual(device.errors, [])
+        self.assertTrue(device.present)
+        self.assertIsNotNone(device.accessible)
+        self.assertFalse(device.busy)
 
     def test_no_serial_and_missing_node(self):
         make_fake_sysfs(self.root / "sys", self.root / "dev", serial=None)
@@ -371,6 +374,8 @@ class LinuxDiscoveryTests(unittest.TestCase):
         device = tr.discover_linux_usblp(self.root / "sys", self.root / "dev")[0]
         self.assertIsNone(device.serial)
         self.assertTrue(any("does not exist" in error for error in device.errors))
+        self.assertFalse(device.present)
+        self.assertIsNone(device.accessible)
 
     def test_no_usbmisc(self):
         self.assertEqual(tr.discover_linux_usblp(self.root, self.root), [])
@@ -661,6 +666,8 @@ class WindowsOpenAndDiscoveryTests(unittest.TestCase):
         self.assertEqual(device.serial, "Q529E56G9290059")
         self.assertEqual(device.model, "PM2411BT")
         self.assertEqual(device.kind, "usbprint")
+        self.assertTrue(device.accessible)
+        self.assertFalse(device.busy)
         self.assertEqual(self.api.handles, set())  # opened and closed again
 
     def test_discovery_lists_busy_device(self):
@@ -669,6 +676,25 @@ class WindowsOpenAndDiscoveryTests(unittest.TestCase):
         devices = tr.discover_windows_usbprint(self.api)
         self.assertEqual(devices[0].model, "")
         self.assertIn("spooler", devices[0].errors[0])
+        self.assertTrue(devices[0].busy)
+        self.assertIsNone(devices[0].accessible)
+
+    def test_discovery_access_denied_is_busy(self):
+        # usbprint answers ERROR_ACCESS_DENIED when another handle is open.
+        self.api.paths = [PRINTER_PATH]
+        self.api.open_error = tr.ERROR_ACCESS_DENIED
+        self.assertTrue(tr.discover_windows_usbprint(self.api)[0].busy)
+
+    def test_discovery_device_vanished(self):
+        self.api.paths = [PRINTER_PATH]
+        self.api.open_error = tr.ERROR_FILE_NOT_FOUND
+        device = tr.discover_windows_usbprint(self.api)[0]
+        self.assertFalse(device.busy)
+        self.assertFalse(device.accessible)
+
+    def test_printer_is_opened_exclusively(self):
+        # Nobody (the spooler included) may interleave bytes into our job.
+        self.assertEqual(tr.USBPRINT_SHARE_MODE, 0)
 
     def test_ctypes_api_refuses_off_windows(self):
         if ON_WINDOWS:
@@ -691,6 +717,25 @@ class RealWindowsTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 30)
         # The raw enumeration must succeed (not just be swallowed).
         tr.CtypesWin32Api().list_interface_paths(tr.GUID_DEVINTERFACE_USBPRINT)
+
+    def test_exclusive_open_is_exclusive(self):
+        """Our handle locks others out, and an open file makes us 'busy'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "device")
+            with open(path, "wb"):
+                pass
+            transport = WindowsUsbprintTransport(path)
+            try:
+                with self.assertRaises(PermissionError):
+                    with open(path, "rb"):
+                        pass
+            finally:
+                transport.close()
+            with open(path, "rb"):
+                with self.assertRaises(DeviceUnavailable) as caught:
+                    WindowsUsbprintTransport(path)
+            self.assertEqual(caught.exception.reason, "busy")
+            self.assertEqual(caught.exception.winerror, tr.ERROR_SHARING_VIOLATION)
 
     def test_open_missing_device(self):
         path = "\\\\?\\usb#vid_0000&pid_0000#none#" + tr.GUID_DEVINTERFACE_USBPRINT
