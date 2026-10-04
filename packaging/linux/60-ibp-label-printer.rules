@@ -1,0 +1,13 @@
+# ibp-printing: let the logged-in desktop user open the label printer's usblp
+# node (/dev/usb/lpN) for direct USB printing, without joining the "lp" group.
+#
+# 2e3c is the USB vendor of the PM2411BT (Artery AT32, shared by many OEM
+# label printers). The rule only grants an ACL to the active local session
+# (systemd-logind applies TAG "uaccess" in 73-seat-late.rules, so this file
+# must sort before 73).
+#
+# Install:
+#   sudo install -m 0644 60-ibp-label-printer.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usbmisc
+# (or unplug and replug the printer)
+SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", ATTRS{idVendor}=="2e3c", TAG+="uaccess"
