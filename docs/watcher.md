@@ -28,6 +28,14 @@ downloaded one from easypost.com), it prints it the same way.
 > one. Likewise, if a label in `to-print\` will never be used, delete the file
 > **and** refund the shipment in EasyPost: the apps did not refund it.
 
+A supported printer connected for **direct USB printing** (the PM2411BT, see
+the README) needs no print queue; the watcher uses it like any other printer
+through the library. Its outcomes map onto the same folders: "nothing sent"
+(printer busy, cover open, not answering) goes to `to-print\`, and anything
+the printer may have partly printed (paper out, no "done" report) goes to
+`check-printer\`. After a paper-out, power-cycle the printer before loading
+paper.
+
 ## The three folders
 
 All three are inside the watched folder (Downloads):
