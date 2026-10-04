@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ibp_printing.winconst import (
     PRINTER_ATTRIBUTE_BITS,
@@ -11,6 +11,27 @@ from ibp_printing.winconst import (
     PRINTER_STATUS_BITS,
     decode_bits,
 )
+
+if TYPE_CHECKING:
+    from ibp_printing.direct.transport import DirectDevice
+
+# Printers the direct-USB path can drive, by IEEE 1284 MDL (case-insensitive).
+# Matching is by model, never by VID:PID alone: the PM2411BT's VID (Artery,
+# 2E3C) is shared by many unrelated devices.
+SUPPORTED_DIRECT_MODELS = frozenset({"PM2411BT"})
+
+# Direct candidates are named "<model> (USB direct, serial <serial>)".
+DIRECT_NAME_MARK = "(USB direct"
+
+UDEV_RULE_HINT = (
+    "install packaging/linux/60-ibp-label-printer.rules to /etc/udev/rules.d/ "
+    "and replug the printer"
+)
+
+
+def is_supported_direct_model(model: str) -> bool:
+    """True if ``model`` (a 1284 MDL) is a printer the direct path supports."""
+    return model.strip().upper() in SUPPORTED_DIRECT_MODELS
 
 
 @dataclass(frozen=True)
@@ -88,18 +109,39 @@ class UsbDevice:
 
 @dataclass(frozen=True)
 class PrinterCandidate:
-    """A print queue together with the result of each detection check."""
+    """A printer that can be printed to, with the result of each check.
+
+    Usually a print queue (``transport == "queue"``). A printer driven
+    directly over USB without a queue or driver has ``direct_device`` set
+    (``transport == "direct"``); its ``queue`` is synthetic (the name, the
+    device path as ``port``), ``usb_devices`` is empty, and ``vid_pid`` is
+    the device's.
+    """
 
     queue: PrintQueue
     vid_pid: Optional[str]
     usb_devices: tuple[UsbDevice, ...] = ()
     # Platforms without USB matching (CUPS) treat every queue as usable.
     usb_matching: bool = True
+    # The USB device a direct candidate prints to (None for a queue).
+    direct_device: Optional["DirectDevice"] = field(default=None, compare=False)
+    # Extra explanations shown by reasons() (e.g. "same printer as ...").
+    notes: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
-        """The spooler name used to print to this queue."""
+        """The name used to print to this printer (spooler or direct name)."""
         return self.queue.name
+
+    @property
+    def transport(self) -> str:
+        """``"direct"`` (USB, no queue or driver) or ``"queue"`` (OS spooler)."""
+        return "direct" if self.direct_device is not None else "queue"
+
+    @property
+    def is_direct(self) -> bool:
+        """True for a printer driven directly over USB."""
+        return self.direct_device is not None
 
     @property
     def connected_devices(self) -> tuple[UsbDevice, ...]:
@@ -108,20 +150,62 @@ class PrinterCandidate:
 
     @property
     def usable(self) -> bool:
-        """True when the queue is a label printer whose USB device is present."""
+        """True when the printer is present and can be tried.
+
+        A queue: a label printer whose USB device is present. A direct
+        device: present and recognised by its 1284 model.
+        """
+        if self.direct_device is not None:
+            return self.direct_device.present and is_supported_direct_model(
+                self.direct_device.model
+            )
         if not self.usb_matching:
             return True
         return self.vid_pid is not None and bool(self.connected_devices)
 
     @property
     def device_healthy(self) -> bool:
-        """True when at least one connected matching USB device is healthy."""
+        """True when at least one connected matching USB device is healthy.
+
+        For a direct device: present, not busy, and not known to be
+        inaccessible (permissions).
+        """
+        if self.direct_device is not None:
+            device = self.direct_device
+            return device.present and not device.busy and device.accessible is not False
         if not self.usb_matching:
             return True
         return any(device.healthy for device in self.connected_devices)
 
     def reasons(self) -> list[str]:
-        """Human-readable explanation of each check for this queue."""
+        """Human-readable explanation of each check for this printer."""
+        if self.direct_device is not None:
+            return self._direct_reasons() + list(self.notes)
+        return self._queue_reasons() + list(self.notes)
+
+    def _direct_reasons(self) -> list[str]:
+        device = self.direct_device
+        assert device is not None
+        model = device.model or "(unknown)"
+        supported = is_supported_direct_model(device.model)
+        reasons = [
+            f"USB direct ({device.kind or 'usb'}) at {device.path}; 1284 model "
+            f"{model} " + ("is supported" if supported else "is NOT supported")
+        ]
+        if not device.model:
+            reasons.append(
+                "could not read the printer's 1284 ID, so it cannot be identified"
+            )
+        if not device.present:
+            reasons.append(f"device node {device.path} is missing")
+        if device.busy:
+            reasons.append("in use by another program or the Windows spooler right now")
+        if device.accessible is False:
+            reasons.append(f"no read/write permission: {UDEV_RULE_HINT}")
+        reasons += [f"note: {error}" for error in device.errors]
+        return reasons
+
+    def _queue_reasons(self) -> list[str]:
         if not self.usb_matching:
             return ["no USB matching on this platform; every queue is usable"]
         if self.vid_pid is None:
@@ -151,14 +235,20 @@ class PrinterCandidate:
             reasons.append(f"queue reports problem: {', '.join(flags)}")
         return reasons
 
-    def rank_key(self) -> tuple[bool, bool, bool, str]:
-        """Sort key: healthy device, then problem-free queue, then default first.
+    def rank_key(self) -> tuple[bool, bool, bool, bool, str]:
+        """Sort key: healthy direct device first, then the queue rules.
 
-        Device health ranks above the queue's problem flags: a queue flag such
-        as OFFLINE often clears by itself once a job is sent to a working
-        device, while a device Windows reports as broken will not print.
+        A direct USB printer that looks ready comes before every queue: it
+        needs no driver and reports how the print ended. Among queues (and
+        direct devices with a known problem, which rank with the unhealthy
+        ones): healthy device, then problem-free queue, then default first.
+        Device health ranks above the queue's problem flags: a queue flag
+        such as OFFLINE often clears by itself once a job is sent to a
+        working device, while a device Windows reports as broken will not
+        print.
         """
         return (
+            not (self.is_direct and self.device_healthy),
             not self.device_healthy,
             self.queue.has_problem,
             not self.queue.is_default,
@@ -169,6 +259,7 @@ class PrinterCandidate:
         """Flatten for structured logging."""
         return {
             "name": self.name,
+            "transport": self.transport,
             "port": self.queue.port,
             "driver": self.queue.driver,
             "status": self.queue.status_flags,
@@ -179,6 +270,9 @@ class PrinterCandidate:
             "usable": self.usable,
             "reasons": self.reasons(),
             "usb_devices": [asdict(device) for device in self.usb_devices],
+            "direct_device": (
+                self.direct_device.to_log() if self.direct_device is not None else None
+            ),
         }
 
 
@@ -190,6 +284,11 @@ class Discovery:
     usb_devices: list[UsbDevice] = field(default_factory=list)
     candidates: list[PrinterCandidate] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Every USB printer-class device seen by direct discovery (any model).
+    direct_devices: list["DirectDevice"] = field(default_factory=list)
+    # Whether direct USB printing was on for this pass (None: not asked,
+    # e.g. a custom backend without the direct layer).
+    direct_enabled: Optional[bool] = None
 
     @property
     def usable(self) -> list[PrinterCandidate]:

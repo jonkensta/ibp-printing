@@ -24,7 +24,7 @@ import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 LOGGER_NAME = "ibp_printing"
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -424,7 +424,23 @@ def configure_logging(
         platform=sys.platform,
         pid=os.getpid(),
     )
+    for hook in list(_CONFIGURE_HOOKS):
+        try:
+            hook(f"configure_logging(app={app})")
+        except Exception:  # pylint: disable=broad-exception-caught
+            package_logger.exception("configure_logging hook failed")
     return log_dir
+
+
+# Called with a context string at the end of every configure_logging call,
+# e.g. to record which printing mode (direct USB on/off) is active.
+_CONFIGURE_HOOKS: list[Callable[[str], Any]] = []
+
+
+def add_configure_hook(hook: Callable[[str], Any]) -> None:
+    """Run ``hook(context)`` after each :func:`configure_logging` (once per hook)."""
+    if hook not in _CONFIGURE_HOOKS:
+        _CONFIGURE_HOOKS.append(hook)
 
 
 def install_exception_hooks() -> None:

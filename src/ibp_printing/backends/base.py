@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from PIL import Image
 
-from ibp_printing.models import Discovery, PrintResult
+from ibp_printing.models import Discovery, PrinterCandidate, PrintResult
 
 
 class PrintError(RuntimeError):
@@ -50,6 +50,23 @@ class PrinterBackend(ABC):
             PrintError: Only if the job definitely never reached the spooler;
                 a possible partial submission returns ``JobOutcome.UNCERTAIN``.
         """
+
+    def print_to_candidate(
+        self,
+        img: Image.Image,
+        candidate: PrinterCandidate,
+        *,
+        job_name: str,
+        track_timeout_s: float = 0.0,
+    ) -> PrintResult:
+        """Print to a candidate from :meth:`discover` (same contract as print_image).
+
+        The default prints to ``candidate.name``; the direct-USB layer
+        overrides it to use the candidate's device without rediscovering.
+        """
+        return self.print_image(
+            img, candidate.name, job_name=job_name, track_timeout_s=track_timeout_s
+        )
 
     def recent_print_events(
         self, minutes: int = 15, max_events: int = 40

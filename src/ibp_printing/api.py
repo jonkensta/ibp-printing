@@ -7,6 +7,10 @@ from typing import Optional
 from PIL import Image
 
 from ibp_printing.backends import PrinterBackend, PrintError, create_backend
+from ibp_printing.direct.config import (  # pylint: disable=unused-import
+    direct_enabled,
+    set_direct_enabled,
+)
 from ibp_printing.log import (
     attempt,
     current_attempt_id,
@@ -33,7 +37,11 @@ def get_backend() -> PrinterBackend:
 
 
 def set_backend(backend: Optional[PrinterBackend]) -> None:
-    """Override the backend (tests, dry runs). ``None`` restores auto-detection."""
+    """Override the backend (tests, dry runs). ``None`` restores auto-detection.
+
+    The backend given replaces everything, including the direct USB layer;
+    wrap it in ``ibp_printing.direct.backend.DirectFirstBackend`` to keep it.
+    """
     global _BACKEND  # pylint: disable=global-statement
     with _BACKEND_LOCK:
         _BACKEND = backend
@@ -68,16 +76,21 @@ def print_image(
     job_name: Optional[str] = None,
     track_timeout_s: float = 0.0,
 ) -> PrintResult:
-    """Print to a specific printer.
+    """Print to a specific printer (a queue name or a direct USB candidate name).
 
     Check ``result.outcome.ok``: ``JobOutcome.UNCERTAIN`` means a failure
-    after StartDoc where the label may still print, and
+    after StartDoc (or, for a direct USB printer, a job the printer may have
+    partly taken) where the label may still print, and
     ``JobOutcome.TRACKING_FAILED`` means it was spooled but could not be
     followed. Neither should be refunded or resent automatically.
 
+    Direct USB jobs are always followed until the printer reports DONE:
+    ``track_timeout_s`` then only lengthens the wait for DONE beyond its
+    30 s default.
+
     Raises:
         PrintError: (a RuntimeError) only if the job definitely never reached
-            the spooler.
+            the spooler (or the direct USB printer).
     """
     with attempt("print_image", printer=printer_name, image=describe_image(img)):
         result = get_backend().print_image(
@@ -99,9 +112,11 @@ def print_to_first_available(
     """Print to the best usable label printer, falling back to the next one.
 
     Fallback only happens on PrintError, which the backends raise only when
-    the job definitely never reached the spooler. A job that may have been
-    submitted comes back as ``JobOutcome.UNCERTAIN`` and is never re-sent to a
-    second printer.
+    the job definitely never reached the spooler (or the direct USB printer,
+    which is tried first when one is plugged in; its own Windows queue, if
+    any, comes later in the list). A job that may have been submitted comes
+    back as ``JobOutcome.UNCERTAIN`` (or TIMEOUT / ERROR) and is never
+    re-sent to a second printer.
 
     Raises:
         PrintError: if no printer is usable or every printer definitely failed
@@ -129,9 +144,9 @@ def print_to_first_available(
                 **candidate.to_log(),
             )
             try:
-                result = get_backend().print_image(
+                result = get_backend().print_to_candidate(
                     img,
-                    candidate.name,
+                    candidate,
                     job_name=_job_name(job_name),
                     track_timeout_s=track_timeout_s,
                 )

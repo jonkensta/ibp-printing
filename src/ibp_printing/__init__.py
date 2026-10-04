@@ -1,6 +1,7 @@
 """Shared USB label-printer discovery, printing, and diagnostics for IBP."""
 
 from ibp_printing.api import (
+    direct_enabled,
     discover,
     find_label_printers,
     get_backend,
@@ -8,6 +9,7 @@ from ibp_printing.api import (
     print_image,
     print_to_first_available,
     set_backend,
+    set_direct_enabled,
 )
 from ibp_printing.backends import PrinterBackend, PrintError
 from ibp_printing.log import configure_logging, default_log_dir, log_file_names
@@ -32,6 +34,7 @@ __all__ = [
     "UsbDevice",
     "configure_logging",
     "default_log_dir",
+    "direct_enabled",
     "discover",
     "downloads_dir",
     "find_label_printers",
@@ -42,5 +45,6 @@ __all__ = [
     "print_to_first_available",
     "save_for_retry",
     "set_backend",
+    "set_direct_enabled",
     "to_print_dir",
 ]
