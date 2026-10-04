@@ -22,8 +22,7 @@ from typing import Optional
 from PIL import Image
 
 from ibp_printing.direct import lzo
-from ibp_printing.models import DeviceCaps
-from ibp_printing.render import compute_draw_rect, flatten_for_print, orient_portrait
+from ibp_printing.render import flatten_for_print, orient_portrait
 
 # 4x6 in at 203 dpi.
 LABEL_WIDTH_DOTS = 812
@@ -35,15 +34,6 @@ DARK_THRESHOLD = 0xAF
 # Raster slice size for BITMAP mode 4 (as the vendor filter).
 SLICE_SIZE = 4096
 BITMAP_MODE_LZO = 4
-
-LABEL_CAPS = DeviceCaps(
-    horzres=LABEL_WIDTH_DOTS,
-    vertres=LABEL_HEIGHT_DOTS,
-    physical_width=LABEL_WIDTH_DOTS,
-    physical_height=LABEL_HEIGHT_DOTS,
-    dpi_x=203,
-    dpi_y=203,
-)
 
 CRLF = b"\r\n"
 JOB_HEADER_LINES = (
@@ -66,17 +56,48 @@ QUERY_PAPER = b"SSSGETPAPER\r\n"
 _DARK_LUT = [255 if value <= DARK_THRESHOLD else 0 for value in range(256)]
 
 
+def label_rect(size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """``(left, top, width, height)`` that fills the label with an image of ``size``.
+
+    The image is scaled to fit 812x1218 at 100 % (keeping its aspect ratio,
+    integer math so a 2:3 image fills the label exactly) and centered.
+    """
+    width, height = size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"image has no area: {size}")
+    if width * LABEL_HEIGHT_DOTS >= height * LABEL_WIDTH_DOTS:
+        new_w = LABEL_WIDTH_DOTS
+        new_h = min(LABEL_HEIGHT_DOTS, max(1, round(height * LABEL_WIDTH_DOTS / width)))
+    else:
+        new_h = LABEL_HEIGHT_DOTS
+        new_w = min(LABEL_WIDTH_DOTS, max(1, round(width * LABEL_HEIGHT_DOTS / height)))
+    left = (LABEL_WIDTH_DOTS - new_w) // 2
+    top = (LABEL_HEIGHT_DOTS - new_h) // 2
+    return left, top, new_w, new_h
+
+
 def place_on_label(img: Image.Image) -> Image.Image:
     """Return an 812x1218 grey ("L") label image holding ``img``.
 
-    Same placement as the GDI/CUPS backends: rotate landscape to portrait
-    (never crop), scale to fit at ``render.PRINT_SCALE_FACTOR`` and center.
+    Landscape images are rotated to portrait (never cropped). An image that is
+    already 812x1218 (a 4x6 label at 203 dpi) is used dot for dot. Anything
+    else is scaled to *fill* the label (100 %, not the GDI path's 95 %) with
+    nearest-neighbour resampling and centered.
+
+    Why not LANCZOS/BOX at 95 % like the GDI path: the barcode study in
+    ``tests/test_direct_barcodes.py`` (Code 128 and USPS IMpb GS1-128 on
+    1200x1800 300 dpi labels, decoded with zbar after simulated dot gain)
+    found that nearest at 100 % keeps every bar's edges on whole dots in a
+    consistent way, while filtered resampling plus a threshold, or any 95 %
+    shrink, turns 3-pixel modules into 1-3 dot bars and loses decodes. The
+    full 812x1218 raster printed on hardware with every edge inside the label,
+    so the GDI path's 5 % backoff (for unknown driver margins) is not needed.
     """
     img = flatten_for_print(orient_portrait(img)).convert("L")
-    left, top, right, bottom = compute_draw_rect(img.size, LABEL_CAPS)
-    size = (right - left, bottom - top)
-    if img.size != size:
-        img = img.resize(size, Image.Resampling.LANCZOS)
+    if img.size == (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS):
+        return img
+    left, top, new_w, new_h = label_rect(img.size)
+    img = img.resize((new_w, new_h), Image.Resampling.NEAREST)
     canvas = Image.new("L", (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS), 255)
     canvas.paste(img, (left, top))
     return canvas

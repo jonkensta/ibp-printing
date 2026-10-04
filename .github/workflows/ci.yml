@@ -28,6 +28,10 @@ jobs:
         with:
           python-version-file: ".python-version"
 
+      - name: Install zbar (barcode decode tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libzbar0
+
       - name: Install the project
         run: uv sync --locked --extra watcher --dev
 

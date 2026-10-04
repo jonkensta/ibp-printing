@@ -36,6 +36,8 @@ dev = [
     "mypy>=1.16.1",
     "pylint>=3.3.7",
     "types-pywin32>=310.0.0.20250516",
+    "pyzbar>=0.1.9",
+    "python-barcode>=0.16.1",
 ]
 
 [build-system]

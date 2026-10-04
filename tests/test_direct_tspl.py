@@ -77,6 +77,10 @@ class ReferenceJobTests(unittest.TestCase):
         # Our compressor mirrors liblzo2's, so even the payload matches.
         self.assertEqual(tspl.build_job(tspl.pack_raster(self.label)), self.reference)
 
+    def test_rasterize_keeps_the_reference_label_dot_for_dot(self):
+        # The verified label is already 812x1218: rasterize() must not scale it.
+        self.assertEqual(tspl.build_job(tspl.rasterize(self.label)), self.reference)
+
     @unittest.skipUnless(LibLzo2.get(), "liblzo2 not available")
     def test_liblzo2_decompresses_every_slice(self):
         lib = LibLzo2.get()
@@ -138,18 +142,39 @@ class RasterizeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tspl.pack_raster(Image.new("L", (100, 100), 0))
 
-    def test_landscape_is_rotated_scaled_and_centered(self):
-        # A landscape black image: rotated to portrait, fit at 95 %, centered.
-        raster = tspl.rasterize(Image.new("RGB", (1800, 1200), "black"))
-        scaled_w, scaled_h = int(0.95 * 812), int(0.95 * 812 * 1800 / 1200)
-        self.assertLessEqual(scaled_h, 1218)
-        left, top = (812 - scaled_w) // 2, (1218 - scaled_h) // 2
-        self.assertTrue(bit_is_black(raster, 406, 609))
-        self.assertTrue(bit_is_black(raster, left + 2, top + 2))
-        self.assertFalse(bit_is_black(raster, left - 2, 609))
-        self.assertFalse(bit_is_black(raster, 406, top - 2))
-        self.assertFalse(bit_is_black(raster, 0, 0))
-        self.assertFalse(bit_is_black(raster, 811, 1217))
+    def test_landscape_is_rotated_filled_and_centered(self):
+        # A landscape black image: rotated to portrait (1000x1800), scaled to
+        # the full label height (100 %, not 95 %) and centered horizontally.
+        raster = tspl.rasterize(Image.new("RGB", (1800, 1000), "black"))
+        scaled_w = round(1000 * 1218 / 1800)  # 677
+        left = (812 - scaled_w) // 2
+        self.assertEqual(tspl.label_rect((1000, 1800)), (left, 0, scaled_w, 1218))
+        self.assertTrue(bit_is_black(raster, 406, 0))
+        self.assertTrue(bit_is_black(raster, 406, 1217))
+        self.assertTrue(bit_is_black(raster, left, 609))
+        self.assertTrue(bit_is_black(raster, left + scaled_w - 1, 609))
+        self.assertFalse(bit_is_black(raster, left - 1, 609))
+        self.assertFalse(bit_is_black(raster, left + scaled_w, 609))
+
+    def test_2_3_image_fills_the_whole_label(self):
+        for size in ((1200, 1800), (1624, 2436), (1218, 1827), (400, 600)):
+            with self.subTest(size=size):
+                self.assertEqual(tspl.label_rect(size), (0, 0, 812, 1218))
+                raster = tspl.rasterize(Image.new("L", size, 0))
+                # Every dot black; the 4 padding dots per row (812..815) white.
+                row = b"\x00" * (tspl.BYTES_PER_ROW - 1) + b"\x0f"
+                self.assertEqual(raster, row * tspl.LABEL_HEIGHT_DOTS)
+
+    def test_label_sized_image_is_not_resampled(self):
+        img = Image.new("L", (812, 1218), 255)
+        for x in range(0, 812, 3):  # 1-dot lines every 3 dots survive exactly
+            img.paste(0, (x, 0, x + 1, 1218))
+        self.assertEqual(tspl.place_on_label(img).tobytes(), img.tobytes())
+        self.assertEqual(tspl.rasterize(img), tspl.pack_raster(img))
+
+    def test_label_rect_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            tspl.label_rect((0, 10))
 
     def test_orientation_keeps_top_first(self):
         # Portrait 4x6 at 300 dpi with a black band at the top.
