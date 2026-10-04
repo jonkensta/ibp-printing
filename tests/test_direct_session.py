@@ -14,6 +14,7 @@ from ibp_printing.direct.session import (
     SessionOutcome,
     SessionTimeouts,
     print_label,
+    probe_status,
 )
 from ibp_printing.models import JobOutcome
 
@@ -456,6 +457,49 @@ class RealFakeTransportTests(unittest.TestCase):
         result = print_label(stalled, WHITE, job_name="fake", timeouts=fast)
         self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
         self.assertEqual(result.bytes_written, 500)
+
+
+class ProbeTests(SessionTestCase):
+    """probe_status: label-safe queries only, never raises."""
+
+    def probe(self):
+        """probe_status on the fake printer with the virtual clock."""
+        return probe_status(self.printer, clock=self.clock)
+
+    def test_ready_printer(self):
+        probe = self.probe()
+        self.assertEqual(self.printer.writes, [CAP, PAPER])
+        self.assertEqual((probe.cover, probe.paper), ("CLOSE", "YES"))
+        self.assertTrue(probe.ready)
+        self.assertIsNone(probe.error)
+        self.assertEqual(probe.lines, ["SSSGETCAP:CLOSE", "SSSGETPAPER:YES"])
+        self.assertIn("cover CLOSE", probe.summary())
+        self.assertTrue(probe.to_log()["ready"])
+
+    def test_cover_open_and_realign(self):
+        self.printer.cover = "OPEN"
+        self.printer.push(0.0, "SSSGETPRINTING:DOING")
+        probe = self.probe()
+        self.assertEqual(probe.cover, "OPEN")
+        self.assertEqual(probe.printing, "DOING")
+        self.assertFalse(probe.ready)
+        self.assertIn("printing DOING", probe.summary())
+
+    def test_no_reply_is_retried_then_reported(self):
+        self.printer.answer_queries = False
+        probe = self.probe()
+        self.assertEqual(self.printer.writes, [CAP, CAP, PAPER])
+        self.assertIsNone(probe.cover)
+        self.assertFalse(probe.ready)
+        self.assertIn("cover no reply", probe.summary())
+
+    def test_transport_failure_never_raises(self):
+        self.printer.read_raises = FakeDeviceGone(0)
+        probe = self.probe()
+        self.assertFalse(probe.ready)
+        self.assertIn("device gone", probe.error or "")
+        self.assertIn("probe failed", probe.summary())
+        self.assertEqual(self.printer.job_writes, [])
 
 
 if __name__ == "__main__":

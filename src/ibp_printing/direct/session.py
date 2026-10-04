@@ -176,6 +176,40 @@ class SessionResult:  # pylint: disable=too-many-instance-attributes
         }
 
 
+@dataclass
+class StatusProbe:  # pylint: disable=too-many-instance-attributes
+    """What a label-safe status probe learned (see :func:`probe_status`)."""
+
+    cover: Optional[str] = None
+    paper: Optional[str] = None
+    # Last SSSGETPRINTING value pushed (DOING = moving paper, e.g. a realign).
+    printing: Optional[str] = None
+    lines: list[str] = field(default_factory=list)
+    history: list[str] = field(default_factory=list)
+    error: Optional[str] = None
+    elapsed_s: float = 0.0
+
+    @property
+    def ready(self) -> bool:
+        """True when a print would pass the pre-check right now."""
+        return self.error is None and self.cover == "CLOSE" and self.printing != "DOING"
+
+    def summary(self) -> str:
+        """One line for people: cover, paper, printing state or the error."""
+        if self.error:
+            return f"probe failed: {self.error}"
+        cover = self.cover or "no reply"
+        paper = self.paper or "no reply"
+        text = f"cover {cover}, paper sensor {paper} (unreliable)"
+        if self.printing:
+            text += f", printing {self.printing}"
+        return text
+
+    def to_log(self) -> dict[str, Any]:
+        """Flatten for structured logging."""
+        return {**dataclasses.asdict(self), "ready": self.ready}
+
+
 ImageOrRaster = Union[Image.Image, bytes, bytearray]
 
 
@@ -425,6 +459,36 @@ class PrintSession:
         finally:
             self.result.timings["precheck_s"] = round(self.clock() - step, 3)
 
+    def probe(self) -> StatusProbe:
+        """Drain, then ask SSSGETCAP and SSSGETPAPER only; never raises.
+
+        Nothing else is written, so the probe cannot feed or print a label.
+        """
+        probe = StatusProbe()
+        try:
+            self._listen(self.timeouts.drain_s)
+            for attempt_no in range(1, self.timeouts.cover_query_attempts + 1):
+                if self._ask(tspl.QUERY_COVER, EventKind.COVER) is not None:
+                    break
+                self._note(f"no cover reply (attempt {attempt_no})", logging.WARNING)
+            self._ask(tspl.QUERY_PAPER, EventKind.PAPER)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            probe.error = exception_summary(exc)
+            self._note(
+                f"status probe failed: {probe.error}",
+                logging.WARNING,
+                error=describe_exception(exc),
+            )
+        probe.cover = self.result.cover
+        probe.paper = self.result.paper
+        probe.printing = self.printing
+        probe.lines = [event.raw for _, event in self.result.events]
+        probe.history = list(self.result.history)
+        self._finish_timing()
+        probe.elapsed_s = self.result.elapsed_s
+        log_event(logger, logging.INFO, "status probe", **probe.to_log())
+        return probe
+
     def send(self, job: bytes) -> bool:
         """Write the job once; True if every byte was accepted.
 
@@ -601,6 +665,25 @@ def prepare_job(img_or_raster: ImageOrRaster) -> bytes:
         compress_s=round(done - rasterized, 3),
     )
     return job
+
+
+def probe_status(
+    transport: "Transport",
+    *,
+    timeouts: Optional[SessionTimeouts] = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> StatusProbe:
+    """Ask the printer for its cover and paper state without printing.
+
+    Label-safe: only ``SSSGETCAP`` and ``SSSGETPAPER`` (plus a bare CR LF if a
+    query was cut short) are written. Never raises; a failure is in
+    ``probe.error``. Only use it on a recognised PM2411BT - another printer
+    could print the query text.
+    """
+    session = PrintSession(
+        transport, job_name="status probe", timeouts=timeouts, clock=clock
+    )
+    return session.probe()
 
 
 def print_label(
