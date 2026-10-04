@@ -15,7 +15,14 @@ class PrintError(RuntimeError):
     It is safe to retry (or send to another printer) after a PrintError. A
     failure that may have left a job behind is reported as a PrintResult with
     ``JobOutcome.UNCERTAIN`` instead.
+
+    ``reason`` is a short machine-readable code when one is known (e.g. the
+    direct USB path's ``cover_open``, ``realign_busy``, ``busy``), else None.
     """
+
+    def __init__(self, *args: Any, reason: Optional[str] = None) -> None:
+        super().__init__(*args)
+        self.reason = reason
 
 
 class PrinterBackend(ABC):

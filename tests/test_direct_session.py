@@ -1,7 +1,8 @@
 """Tests for the PM2411BT direct print session (outcome mapping)."""
 
 import unittest
-from typing import Callable, Optional
+from unittest import mock
+from typing import Any, Callable, Optional
 
 from PIL import Image
 from printing_helpers import quiet_logging
@@ -42,18 +43,25 @@ class FakeDeviceGone(Exception):
         self.bytes_accepted = bytes_accepted
 
 
-class ScriptedPrinter:
+COVER_REPLY = "<cover reply>"  # resolved to the cover state when delivered
+
+
+class ScriptedPrinter:  # pylint: disable=too-many-instance-attributes
     """A PM2411BT model on a virtual clock, honouring the Transport contract.
 
     ``read_lines`` returns lines that are due within the timeout (advancing the
     clock to the first one) or advances the clock by the whole timeout.
-    Behaviour knobs: cover state, reply delay, realign, job reactions, and
-    write acceptance (``accept(data) -> int`` or an exception to raise).
+    Behaviour knobs: cover state (``cover_change`` moves it at a given time,
+    pushing SSSGETCAP and the realign DOING/DONE like the real printer), reply
+    delay, job reactions, and write acceptance (``accept(data) -> int`` or an
+    exception to raise).
     """
 
     def __init__(self, clock: VirtualClock) -> None:
         self.clock = clock
-        self.pending: list[tuple[float, str]] = []
+        # (due time, sequence, line or None, action or None)
+        self.pending: list[tuple[float, int, Optional[str], Any]] = []
+        self._seq = 0
         self.writes: list[bytes] = []
         self.write_timeouts: list[float] = []
         self.cover = "CLOSE"
@@ -65,12 +73,44 @@ class ScriptedPrinter:
         self.accept: Callable[[bytes], int] = len
         self.write_raises: list[BaseException] = []
         self.read_raises: Optional[BaseException] = None
+        self.delivered: list[tuple[float, str]] = []
+        self.write_times: list[tuple[float, bytes]] = []
+        # Called when the whole job has been accepted (to script reactions).
+        self.on_job: Optional[Callable[[], None]] = None
+
+    def _schedule(self, after_s: float, line: Optional[str], action: Any = None):
+        self._seq += 1
+        self.pending.append((self.clock.now + after_s, self._seq, line, action))
+        self.pending.sort(key=lambda item: (item[0], item[1]))
 
     def push(self, after_s: float, *lines: str) -> None:
         """Lines the printer sends ``after_s`` from now."""
         for line in lines:
-            self.pending.append((self.clock.now + after_s, line))
-        self.pending.sort(key=lambda item: item[0])
+            self._schedule(after_s, line)
+
+    def cover_change(
+        self,
+        after_s: float,
+        value: str,
+        *,
+        realign_s: Optional[float] = 2.0,
+        push: bool = True,
+    ) -> None:
+        """The cover moves to ``value`` ``after_s`` from now.
+
+        The printer pushes ``SSSGETCAP:<value>`` (unless ``push`` is False)
+        and, after a close, realigns: DOING at once, DONE ``realign_s`` later
+        (None: the realign never reports DONE).
+        """
+
+        def change() -> None:
+            self.cover = value
+
+        self._schedule(after_s, f"SSSGETCAP:{value}" if push else None, change)
+        if value == "CLOSE":
+            self._schedule(after_s + 0.05, "SSSGETPRINTING:DOING")
+            if realign_s is not None:
+                self._schedule(after_s + realign_s, "SSSGETPRINTING:DONE")
 
     # Transport API -------------------------------------------------------
 
@@ -81,13 +121,14 @@ class ScriptedPrinter:
             raise self.write_raises.pop(0)
         accepted = self.accept(data)
         self.writes.append(data[:accepted])
+        self.write_times.append((self.clock.now, data[:accepted]))
         if accepted < len(data):
             self.clock.now += timeout_s  # stalled for the whole timeout
         sent = data[:accepted]
         body = sent.lstrip(b"\r\n")
         if accepted == len(data) and self.answer_queries:
             if body == CAP:
-                self.push(self.reply_delay_s, f"SSSGETCAP:{self.cover}")
+                self.push(self.reply_delay_s, COVER_REPLY)
             elif body == PAPER:
                 self.push(self.reply_delay_s, "SSSGETPAPER:YES")
         if sent.startswith(b"\r\nSIZE") and accepted == len(data):
@@ -97,6 +138,8 @@ class ScriptedPrinter:
                 self.push(self.done_after_s, "SSSGETPRINTING:DONE")
             for after, line in self.job_replies:
                 self.push(after, line)
+            if self.on_job is not None:
+                self.on_job()
         return accepted
 
     def read_lines(self, timeout_s: float) -> list[str]:
@@ -104,13 +147,22 @@ class ScriptedPrinter:
         if self.read_raises is not None:
             raise self.read_raises
         deadline = self.clock.now + timeout_s
-        if not self.pending or self.pending[0][0] > deadline:
-            self.clock.now = deadline
-            return []
-        self.clock.now = max(self.clock.now, self.pending[0][0])
-        due = [line for at, line in self.pending if at <= self.clock.now]
-        self.pending = [item for item in self.pending if item[0] > self.clock.now]
-        return due
+        due_lines: list[str] = []
+        while not due_lines:
+            if not self.pending or self.pending[0][0] > deadline:
+                self.clock.now = deadline
+                return []
+            self.clock.now = max(self.clock.now, self.pending[0][0])
+            while self.pending and self.pending[0][0] <= self.clock.now:
+                _, _, line, action = self.pending.pop(0)
+                if action is not None:
+                    action()
+                if line == COVER_REPLY:
+                    line = f"SSSGETCAP:{self.cover}"
+                if line is not None:
+                    due_lines.append(line)
+                    self.delivered.append((self.clock.now, line))
+        return due_lines
 
     def close(self) -> None:
         """Nothing to release."""
@@ -156,7 +208,10 @@ class SuccessTests(SessionTestCase):
         self.assertIs(result.outcome, SessionOutcome.COMPLETED)
         self.assertIs(result.job_outcome, JobOutcome.COMPLETED)
         self.assertTrue(result.ok)
-        self.assertEqual(self.printer.writes, [CAP, PAPER, JOB])
+        # Paper (logged), the gate's cover query, the job, the cover check.
+        self.assertEqual(self.printer.writes, [PAPER, CAP, JOB, CAP])
+        self.assertEqual(result.attribution_problems, [])
+        self.assertTrue(any("cover still CLOSE" in line for line in result.history))
         self.assertEqual(result.bytes_written, len(JOB))
         self.assertEqual(result.job_bytes, len(JOB))
         self.assertEqual((result.cover, result.paper), ("CLOSE", "YES"))
@@ -165,23 +220,32 @@ class SuccessTests(SessionTestCase):
         self.assertIn("doing_after_s", result.timings)
         self.assertTrue(any("finished (DONE" in line for line in result.history))
         self.assertGreater(result.elapsed_s, 3.0)
-        self.assertEqual(self.printer.write_timeouts[-1], SessionTimeouts().job_write_s)
+        self.assertEqual(self.printer.write_timeouts[2], SessionTimeouts().job_write_s)
 
     def test_image_input_and_timeout_override(self):
         img = Image.new("L", (1200, 1800), 255)
         img.paste(0, (100, 100, 300, 300))
         result = self.run_print(img, doing_s=2.0, job_write_s=7.0)
         self.assertIs(result.outcome, SessionOutcome.COMPLETED)
-        self.assertEqual(self.printer.write_timeouts[-1], 7.0)
+        self.assertEqual(self.printer.write_timeouts[2], 7.0)
         job = self.printer.job_writes[0]
         self.assertEqual(tspl.parse_job(job), tspl.rasterize(img))
 
     def test_queued_lines_are_drained_and_logged(self):
-        self.printer.push(0.0, "SSSGETCAP:OPEN", "SSSGETCAP:CLOSE", "Cmd error:junk")
+        self.printer.push(
+            0.0,
+            "SSSGETCAP:OPEN",
+            "SSSGETCAP:CLOSE",
+            "SSSGETPRINTING:DOING",
+            "SSSGETPRINTING:DONE",
+            "Cmd error:junk",
+        )
         result = self.run_print()
         self.assertIs(result.outcome, SessionOutcome.COMPLETED)
-        self.assertTrue(any("drained 3 queued line(s)" in h for h in result.history))
+        self.assertTrue(any("drained 5 queued line(s)" in h for h in result.history))
         self.assertEqual(result.command_errors, [])
+        # The queued realign's DOING/DONE are not the label's.
+        self.assertEqual(result.attribution_problems, [])
 
     def test_stale_done_before_job_is_not_counted(self):
         self.printer.push(0.0, "SSSGETPRINTING:DONE")
@@ -189,6 +253,14 @@ class SuccessTests(SessionTestCase):
         self.printer.done_after_s = None
         result = self.run_print()
         self.assertIs(result.outcome, SessionOutcome.UNCERTAIN)
+
+    def test_any_rasterize_failure_is_a_clean_failure(self):
+        bomb = Image.DecompressionBombError("too many pixels")
+        with mock.patch.object(tspl, "rasterize", side_effect=bomb):
+            with self.assertRaises(DirectPrintError) as caught:
+                self.run_print(Image.new("L", (10, 10), 255))
+        self.assertEqual(caught.exception.reason, "bad_image")
+        self.assertEqual(self.printer.writes, [])
 
     def test_bad_input_is_a_clean_failure(self):
         with self.assertRaises(DirectPrintError) as caught:
@@ -203,12 +275,16 @@ class PrecheckTests(SessionTestCase):
     def test_cover_open(self):
         self.printer.cover = "OPEN"
         error = self.assert_not_sent("cover_open")
-        self.assertIn("OPEN", str(error))
+        self.assertTrue(str(error).startswith("Close the printer cover"))
+        self.assertTrue(any("cover is OPEN" in line for line in error.history))
+        self.assertFalse(error.same_printer_fallback)
 
     def test_no_cover_reply(self):
         self.printer.answer_queries = False
-        self.assert_not_sent("no_cover_reply")
-        self.assertEqual(self.printer.writes, [CAP, CAP])
+        error = self.assert_not_sent("no_cover_reply")
+        self.assertEqual(self.printer.writes, [PAPER, CAP, CAP])
+        self.assertIn("off and on", str(error))
+        self.assertFalse(error.same_printer_fallback)
 
     def test_cover_reply_on_second_attempt(self):
         self.printer.reply_delay_s = 2.0  # later than query_reply_s
@@ -230,7 +306,49 @@ class PrecheckTests(SessionTestCase):
 
     def test_cover_opened_during_realign(self):
         self.printer.push(0.0, "SSSGETPRINTING:DOING")
-        self.printer.push(2.0, "SSSGETCAP:OPEN", "SSSGETPRINTING:DONE")
+        self.printer.cover_change(2.0, "OPEN")
+        self.printer.push(2.0, "SSSGETPRINTING:DONE")
+        self.assert_not_sent("cover_open")
+
+    def test_realign_before_job(self):
+        """Cover closed just before the print: wait for the realign, then send."""
+        self.printer.cover = "OPEN"
+        self.printer.cover_change(0.3, "CLOSE", realign_s=2.0)
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.COMPLETED, result.history)
+        self.assertEqual(result.attribution_problems, [])
+        realign_done = next(
+            at for at, line in self.printer.delivered if line.endswith(":DONE")
+        )
+        job_at = next(at for at, data in self.printer.write_times if data == JOB)
+        self.assertGreater(job_at, realign_done)
+        self.assertTrue(any("realign finished" in h for h in result.history))
+
+    def test_close_without_realign_report_is_refused(self):
+        """A pushed CLOSE whose realign never shows up: do not send."""
+        self.printer.push(0.0, "SSSGETCAP:OPEN", "SSSGETCAP:CLOSE")
+        error = self.assert_not_sent("realign_busy")
+        self.assertTrue(str(error).startswith("Close the printer cover"))
+        self.assertFalse(error.same_printer_fallback)
+
+    def test_cover_closed_during_gate_waits_for_realign(self):
+        self.printer.cover = "OPEN"
+        self.printer.cover_change(1.0, "CLOSE", realign_s=2.0)
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.COMPLETED, result.history)
+        self.assertEqual([w for w in self.printer.writes if w == CAP], [CAP] * 3)
+        job_at = next(at for at, data in self.printer.write_times if data == JOB)
+        self.assertGreater(job_at, self.printer.delivered[0][0] + 3.0)
+
+    def test_cover_opened_during_paper_query(self):
+        self.printer.cover_change(0.55, "OPEN")
+        self.assert_not_sent("cover_open")
+
+    def test_stale_close_push_does_not_answer_the_cover_query(self):
+        """The reply that follows a racing push wins (cover really OPEN)."""
+        self.printer.cover = "OPEN"
+        self.printer.reply_delay_s = 0.4
+        self.printer.push(1.0, "SSSGETCAP:CLOSE")  # before the real reply
         self.assert_not_sent("cover_open")
 
     def test_read_failure_is_a_clean_failure(self):
@@ -380,15 +498,77 @@ class WatchTests(SessionTestCase):
         result = self.run_print()
         self.assertIs(result.outcome, SessionOutcome.COMPLETED)
 
-    def test_cover_opened_mid_print_is_logged(self):
+    def test_cover_opened_mid_print_is_uncertain(self):
         self.printer.done_after_s = None
-        self.printer.job_replies = [(2.0, "SSSGETCAP:OPEN")]
+        self.printer.on_job = lambda: self.printer.cover_change(2.0, "OPEN")
         result = self.run_print()
-        self.assertIs(result.outcome, SessionOutcome.TIMEOUT)
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN)
         self.assertEqual(result.cover, "OPEN")
         self.assertTrue(
             any("cover changed: CLOSE -> OPEN" in h for h in result.history)
         )
+        self.assertEqual(len(self.printer.job_writes), 1)
+
+    def test_realign_during_job_is_never_completed(self):
+        """The label never prints; a cover cycle's realign supplies DOING/DONE."""
+        self.printer.doing_after_s = None
+        self.printer.done_after_s = None
+
+        def cycle() -> None:
+            self.printer.cover_change(0.5, "OPEN")
+            self.printer.cover_change(1.0, "CLOSE", realign_s=2.0)
+
+        self.printer.on_job = cycle
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertTrue(result.saw_doing and result.saw_done)
+        self.assertTrue(result.attribution_problems)
+        self.assertNotIn(CAP, self.printer.writes[3:])  # no query after the job
+
+    def test_cover_cycle_after_label_is_uncertain(self):
+        """Label prints, then the cover is opened and closed: not provable."""
+
+        def cycle() -> None:
+            self.printer.cover_change(3.5, "OPEN")
+            self.printer.cover_change(3.8, "CLOSE")
+
+        self.printer.on_job = cycle
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+
+    def test_cover_open_after_done_without_push(self):
+        """A missed push is caught by the cover query after DONE."""
+        self.printer.on_job = lambda: self.printer.cover_change(2.5, "OPEN", push=False)
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN)
+        self.assertTrue(
+            any("cover is OPEN after DONE" in p for p in result.attribution_problems)
+        )
+
+    def test_unpushed_realign_then_label_is_uncertain(self):
+        """Cover cycle with no pushes: the realign's DONE comes first, then the
+        label's DOING shows up while the cover is checked."""
+        self.printer.doing_after_s = 2.5
+        self.printer.done_after_s = 4.0
+
+        def cycle() -> None:
+            self.printer.cover_change(0.2, "OPEN", push=False)
+            self.printer.cover_change(0.4, "CLOSE", push=False, realign_s=1.0)
+
+        self.printer.on_job = cycle
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertIn("a second DOING", result.attribution_problems)
+
+    def test_second_doing_is_uncertain(self):
+        self.printer.job_replies = [(1.5, "SSSGETPRINTING:DOING")]
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN)
+
+    def test_no_reply_to_cover_check_is_uncertain(self):
+        self.printer.on_job = lambda: setattr(self.printer, "answer_queries", False)
+        result = self.run_print()
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN)
 
     def test_read_failure_while_watching_is_uncertain(self):
         original = self.printer.read_lines
@@ -457,6 +637,66 @@ class RealFakeTransportTests(unittest.TestCase):
         result = print_label(stalled, WHITE, job_name="fake", timeouts=fast)
         self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
         self.assertEqual(result.bytes_written, 500)
+
+
+class WindowsAmbiguousCancelTests(unittest.TestCase):
+    """The session over the Windows transport with a simulated usbprint.sys."""
+
+    def setUp(self):
+        quiet_logging(self)
+        # pylint: disable=import-outside-toplevel
+        from test_direct_transport import PRINTER_PATH, FakeWin32
+
+        from ibp_printing.direct import transport as tr
+
+        self.tr = tr
+        self.api = FakeWin32()
+        patcher = mock.patch.object(tr, "ABANDONED", tr.AbandonedRequests())
+        self.abandoned = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def answer(data: bytes) -> None:
+            body = data.lstrip(b"\r\n")
+            if body == CAP:
+                self.api.incoming.append(b"SSSGETCAP:CLOSE\r\n")
+            elif body == PAPER:
+                self.api.incoming.append(b"SSSGETPAPER:YES\r\n")
+            if body in (CAP, PAPER):
+                # The job's first chunk: 100 bytes go out, then it pends.
+                self.api.write_capacity = len(self.api.written) + 100
+
+        self.api.on_write = answer
+        self.api.partial_pending = True
+        self.transport = tr.WindowsUsbprintTransport(PRINTER_PATH, api=self.api)
+        self.addCleanup(self.transport.close)
+        self.timeouts = SessionTimeouts(
+            drain_s=0.02,
+            query_reply_s=0.05,
+            job_write_s=0.05,
+            doing_s=0.05,
+            done_s=0.05,
+            stall_listen_s=0.01,
+            poll_s=0.01,
+        )
+
+    def test_unconfirmed_cancel_of_job_write_is_uncertain(self):
+        """Not a PrintError: 100 bytes reached the printer, more may follow."""
+        self.api.cancel_stuck_writes = True
+        result = print_label(
+            self.transport, WHITE, job_name="win", timeouts=self.timeouts
+        )
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertEqual(result.bytes_written, -1)  # unknown
+        self.assertTrue(any("unknown part" in line for line in result.history))
+        self.assertEqual(len(self.abandoned), 1)
+
+    def test_confirmed_cancel_of_partial_job_is_uncertain(self):
+        result = print_label(
+            self.transport, WHITE, job_name="win", timeouts=self.timeouts
+        )
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertEqual(result.bytes_written, 100)
+        self.assertEqual(len(self.abandoned), 0)
 
 
 class ProbeTests(SessionTestCase):

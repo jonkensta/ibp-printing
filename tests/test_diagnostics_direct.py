@@ -115,14 +115,18 @@ class DiagDirectTests(unittest.TestCase):
         self.assertIn(f"printer={PM_NAME!r}", out)
         self.assertIn("outcome=completed", out)
         self.assertIn("history: direct USB: fake:lp0", out)
-        self.assertEqual(harness.transport.written_lines[-1], "PRINT 1,1")
+        self.assertEqual(
+            harness.transport.written_lines[-2:], ["PRINT 1,1", "SSSGETCAP"]
+        )
         self.assertEqual(harness.queue_prints, [])
 
     def test_test_print_named_direct_printer(self):
         harness = self.use(Harness())
         code, _ = self.run_main("--test-print", PM_NAME)
         self.assertEqual(code, 0)
-        self.assertEqual(harness.transport.written_lines[-1], "PRINT 1,1")
+        self.assertEqual(
+            harness.transport.written_lines[-2:], ["PRINT 1,1", "SSSGETCAP"]
+        )
 
     def test_no_direct_flag(self):
         harness = self.use(Harness())

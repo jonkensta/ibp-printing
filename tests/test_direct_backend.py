@@ -272,7 +272,8 @@ class RoutingTests(DirectTestCase):
         self.assertTrue(any("DONE" in line for line in result.history))
         self.assertGreater(result.elapsed_s, 0)
         self.assertEqual(harness.queue_prints, [])
-        self.assertEqual(harness.transport.written_lines[-1], "PRINT 1,1")
+        self.assertIn("PRINT 1,1", harness.transport.written_lines)
+        self.assertEqual(harness.transport.written_lines[-1], "SSSGETCAP")
         self.assertTrue(harness.transport.closed)
         # One discovery pass: the candidate's device is reused for printing.
         self.assertEqual(harness.discoveries, 1)

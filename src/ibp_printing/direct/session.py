@@ -3,23 +3,43 @@
 ``print_label`` runs one print over an already-open ``Transport``:
 
 1. drain whatever the printer queued (cover pushes, realign DOING/DONE, ...);
-2. ask ``SSSGETCAP`` (must be ``CLOSE``) and ``SSSGETPAPER`` (logged, never
-   trusted: it says YES with the roll removed);
-3. if a realign (``SSSGETPRINTING:DOING`` without ``DONE``) is running, wait
-   briefly for it to finish;
+2. ask ``SSSGETPAPER`` (logged, never trusted: it says YES with the roll
+   removed);
+3. the *gate*, immediately before the write: wait out any realign that is
+   running or expected, then ask ``SSSGETCAP`` and listen for the whole reply
+   window. The gate passes only when the cover is ``CLOSE`` and nothing in
+   that window (a pushed cover change, a DOING) shows a realign starting;
 4. write the job once, with a timeout;
-5. follow the printer's pushed ``SSSGETPRINTING:DOING`` / ``DONE`` lines.
+5. follow the printer's pushed ``SSSGETPRINTING:DOING`` / ``DONE`` lines, then
+   ask ``SSSGETCAP`` once more to confirm the cover stayed closed.
+
+Realign attribution. The printer pushes the same DOING / DONE pair for the
+automatic realign it runs whenever the cover is closed (no label) as for a
+label. A realign needs a cover close, and the printer pushes
+``SSSGETCAP:OPEN`` / ``CLOSE`` on every cover change, so after the gate a
+realign cannot happen without a cover push. The session therefore counts
+DOING / DONE as the label's only when the sequence after the write is exactly
+one DOING then one DONE, with no cover line other than the reply to the
+post-DONE query, and that reply is ``CLOSE``. Anything else (a cover push
+during the print, DONE without DOING, a second DOING or DONE, the cover not
+confirmed closed afterwards) makes the outcome ``UNCERTAIN``, never
+``COMPLETED``. Before the write, a cover ``CLOSE`` that is pushed (more cover
+lines than queries asked, or a change from ``OPEN``) means a realign is due:
+the gate waits for its DOING / DONE, and refuses to send (``realign_busy``)
+if it never comes.
 
 Outcome mapping (``docs/printers/pm2411bt.md``):
 
 * pre-check fails (no reply, cover open, realign never finishes, query or
   transport failure, or not a single job byte accepted) -> raises
-  ``DirectPrintError`` (a ``PrintError``): nothing was sent, safe to fall back;
-* job not fully accepted within the timeout -> ``UNCERTAIN`` (paper out / jam:
-  a partial job is in the printer, power-cycle it before reloading paper);
-* DOING then DONE -> ``COMPLETED``;
+  ``DirectPrintError`` (a ``PrintError``): nothing was sent;
+* job not fully accepted within the timeout, or a write whose outcome is
+  unknown -> ``UNCERTAIN`` (paper out / jam: a partial job is in the printer,
+  power-cycle it before reloading paper);
+* DOING then DONE, attributed to the label as above -> ``COMPLETED``;
 * DOING but no DONE -> ``TIMEOUT``;
-* no DOING within ``doing_s`` -> ``UNCERTAIN``;
+* no DOING within ``doing_s``, or DOING / DONE that cannot be attributed to
+  the label -> ``UNCERTAIN``;
 * a ``Cmd error:`` reply to part of the job -> ``ERROR`` (the printer misread
   the job; a label may or may not have come out).
 
@@ -59,19 +79,55 @@ PAPER_OUT_HINT = (
 )
 
 
+# What the volunteer is told for pre-check failures that need them to act.
+VOLUNTEER_MESSAGES = {
+    "cover_open": (
+        "Close the printer cover: the label printer's cover is open, so "
+        "nothing was printed."
+    ),
+    "realign_busy": (
+        "Close the printer cover and wait a few seconds: the label printer was "
+        "still lining up its labels (it does this every time the cover is "
+        "closed), so nothing was printed."
+    ),
+    "no_cover_reply": (
+        "Turn the label printer off and on again: it did not answer, so "
+        "nothing was printed."
+    ),
+    "job_not_accepted": (
+        "Turn the label printer off and on again: it did not take the label, "
+        "so nothing was printed."
+    ),
+}
+
+NO_SAME_PRINTER_FALLBACK = frozenset(VOLUNTEER_MESSAGES)
+"""Reasons after which the label must not go to the same physical printer's
+print queue (its VID:PID twin): the cover is open or the printer is
+realigning (the queue would print into an open printer or race the realign),
+or the printer is not answering / not taking data and may be holding a
+partial job (it would swallow the queue's job as bitmap data and the queue
+would report success). The label waits in ``to-print/`` instead."""
+
+
 class DirectPrintError(PrintError):
     """The pre-check failed: no job byte reached the printer.
 
     ``reason`` is a short machine-readable code (``cover_open``,
-    ``no_cover_reply``, ``realign_busy``, ``query_not_accepted``,
-    ``transport_error``, ``job_not_accepted``, ``bad_image``); ``history`` holds
-    the human-readable steps taken so far.
+    ``no_cover_reply``, ``realign_busy``, ``transport_error``,
+    ``job_not_accepted``, ``bad_image``, or from the backend ``busy``,
+    ``permission``, ``not_found``, ``error``, ``disabled``, ``not_usable``);
+    ``history`` holds the human-readable steps taken so far.
     """
 
     def __init__(self, message: str, reason: str, history: list[str]) -> None:
-        super().__init__(message)
-        self.reason = reason
+        super().__init__(message, reason=reason)
+        self.reason: str = reason
         self.history = list(history)
+
+    @property
+    def same_printer_fallback(self) -> bool:
+        """False when the same printer's queue must not be tried next."""
+        return self.reason not in NO_SAME_PRINTER_FALLBACK
 
 
 class SessionOutcome(str, Enum):
@@ -112,6 +168,8 @@ class SessionTimeouts:
     cover_query_attempts: int = 2
     # Waiting for a running realign (DOING) to report DONE before sending.
     realign_wait_s: float = 10.0
+    # After a pushed cover CLOSE: waiting for the realign's DOING to start.
+    realign_start_s: float = 3.0
     # Accepting the whole job; a stall here means paper out / jam.
     job_write_s: float = 20.0
     # After the job is written: waiting for SSSGETPRINTING:DOING.
@@ -141,6 +199,8 @@ class SessionResult:  # pylint: disable=too-many-instance-attributes
     saw_doing: bool = False
     saw_done: bool = False
     command_errors: list[str] = field(default_factory=list)
+    # Why DOING / DONE could not be attributed to this label (-> UNCERTAIN).
+    attribution_problems: list[str] = field(default_factory=list)
     # (seconds since the session started, event) for every line received.
     events: list[tuple[float, PrinterEvent]] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
@@ -169,6 +229,7 @@ class SessionResult:  # pylint: disable=too-many-instance-attributes
             "saw_doing": self.saw_doing,
             "saw_done": self.saw_done,
             "command_errors": self.command_errors,
+            "attribution_problems": self.attribution_problems,
             "events": [[round(at, 3), event.raw] for at, event in self.events],
             "timings": self.timings,
             "history": self.history,
@@ -240,6 +301,12 @@ class PrintSession:
         self._line_dirty = False
         # Set once the job write starts: Cmd errors then count against the job.
         self._job_started = False
+        # SSSGETCAP replies still expected; a cover line beyond them is a push.
+        self._cover_owed = 0
+        # Event index of the last pushed cover CLOSE (a realign follows it).
+        self._close_pushed_at: Optional[int] = None
+        # Event index of the last SSSGETPRINTING:DONE.
+        self._done_at: Optional[int] = None
 
     # ------------------------------------------------------------- helpers
 
@@ -257,7 +324,17 @@ class PrintSession:
     def _fail(self, reason: str, message: str, **data: Any) -> DirectPrintError:
         self._note(f"not sent ({reason}): {message}", logging.ERROR, **data)
         self._finish_timing()
-        return DirectPrintError(message, reason, self.result.history)
+        return DirectPrintError(
+            VOLUNTEER_MESSAGES.get(reason, message), reason, self.result.history
+        )
+
+    def _unattributable(self, why: str) -> None:
+        """DOING / DONE can no longer be counted as this label's."""
+        self.result.attribution_problems.append(why)
+        self._note(
+            f"cannot attribute the printer's DOING/DONE to this label: {why}",
+            logging.WARNING,
+        )
 
     def _finish_timing(self) -> None:
         self.result.elapsed_s = round(self._now(), 3)
@@ -265,6 +342,7 @@ class PrintSession:
     def _handle_line(self, line: str) -> PrinterEvent:
         event = tspl.parse_line(line)
         at = self._now()
+        index = len(self.result.events)
         self.result.events.append((at, event))
         log_event(
             logger,
@@ -275,20 +353,11 @@ class PrintSession:
             **event.to_log(),
         )
         if event.kind is EventKind.COVER:
-            if self.result.cover is not None and self.result.cover != event.value:
-                self._note(f"cover changed: {self.result.cover} -> {event.value}")
-            self.result.cover = event.value
+            self._handle_cover(event, index)
         elif event.kind is EventKind.PAPER:
             self.result.paper = event.value
         elif event.kind is EventKind.PRINTING:
-            self.printing = event.value
-            if self._job_started:
-                if event.value == "DOING":
-                    self.result.saw_doing = True
-                elif event.value == "DONE" and self.result.saw_doing:
-                    self.result.saw_done = True
-                elif event.value == "DONE":
-                    self._note("DONE without DOING (ignored)", logging.WARNING)
+            self._handle_printing(event, index)
         elif event.kind is EventKind.COMMAND_ERROR:
             self._handle_command_error(event)
         else:
@@ -296,6 +365,59 @@ class PrintSession:
                 logger, logging.WARNING, "unrecognised printer line", **event.to_log()
             )
         return event
+
+    def _handle_cover(self, event: PrinterEvent, index: int) -> None:
+        previous = self.result.cover
+        pushed = self._cover_owed <= 0
+        if not pushed:
+            self._cover_owed -= 1
+        if previous is not None and previous != event.value:
+            self._note(f"cover changed: {previous} -> {event.value}")
+        self.result.cover = event.value
+        # After the gate the cover was CLOSE: a CLOSE that answers a query is
+        # harmless, anything else (a push, an OPEN, a change) may mean a
+        # cover cycle and so a realign.
+        if self._job_started and (
+            pushed or event.value != "CLOSE" or previous != "CLOSE"
+        ):
+            self._unattributable(
+                f"cover {event.value} {'pushed' if pushed else 'reported'} "
+                "during the print"
+            )
+        if event.value == "CLOSE" and (pushed or previous == "OPEN"):
+            # The printer realigns (DOING/DONE, no label) after every close.
+            self._close_pushed_at = index
+
+    def _handle_printing(self, event: PrinterEvent, index: int) -> None:
+        self.printing = event.value
+        if event.value == "DONE":
+            self._done_at = index
+        if not self._job_started:
+            return
+        result = self.result
+        if event.value == "DOING":
+            if result.saw_doing:
+                self._unattributable("a second DOING")
+            result.saw_doing = True
+        elif event.value == "DONE":
+            if not result.saw_doing:
+                self._note("DONE without DOING", logging.WARNING)
+                self._unattributable("DONE without DOING")
+            elif result.saw_done:
+                self._unattributable("a second DONE")
+            else:
+                result.saw_done = True
+
+    def _realign_state(self) -> Optional[str]:
+        """``"running"`` (DOING, no DONE yet), ``"due"`` (a pushed cover
+        CLOSE not yet followed by DONE) or None."""
+        if self.printing == "DOING":
+            return "running"
+        if self._close_pushed_at is not None and (
+            self._done_at is None or self._done_at < self._close_pushed_at
+        ):
+            return "due"
+        return None
 
     def _handle_command_error(self, event: PrinterEvent) -> None:
         echoed = event.value.encode("latin-1", errors="replace")
@@ -397,10 +519,43 @@ class PrintSession:
         )
         return replies[-1].value if replies else None
 
+    def _ask_cover(self) -> Optional[str]:
+        """Ask SSSGETCAP, listening for the whole reply window each time.
+
+        Listening the full window (instead of stopping at the first cover
+        line) lets the real reply arrive after a stale or racing push, and
+        counts every cover line: one more than the replies owed is a push.
+        Returns the last cover value heard in the window, or None.
+        """
+        for attempt_no in range(1, self.timeouts.cover_query_attempts + 1):
+            before = len(self.result.events)
+            started = self.clock()
+            if self._write_query(tspl.QUERY_COVER):
+                self._cover_owed += 1
+                self._listen(self.timeouts.query_reply_s)
+            covers = [
+                e.value
+                for _, e in self.result.events[before:]
+                if e.kind is EventKind.COVER
+            ]
+            log_event(
+                logger,
+                logging.DEBUG,
+                "query reply",
+                query="SSSGETCAP",
+                replies=covers,
+                still_owed=self._cover_owed,
+                reply_s=round(self.clock() - started, 3),
+            )
+            if covers:
+                return covers[-1]
+            self._note(f"no cover reply (attempt {attempt_no})", logging.WARNING)
+        return None
+
     # ------------------------------------------------------------ the steps
 
     def precheck(self) -> None:
-        """Drain, check the cover, log paper, wait out a realign.
+        """Drain, log paper, then the gate (see the module docstring).
 
         Raises:
             DirectPrintError: if printing must not start (nothing was sent).
@@ -413,41 +568,9 @@ class PrintSession:
                 f"drained {queued} queued line(s)",
                 lines=[event.raw for _, event in self.result.events],
             )
-
-            cover: Optional[str] = None
-            for attempt_no in range(1, self.timeouts.cover_query_attempts + 1):
-                cover = self._ask(tspl.QUERY_COVER, EventKind.COVER)
-                if cover is not None:
-                    break
-                self._note(f"no cover reply (attempt {attempt_no})", logging.WARNING)
-            if cover is None:
-                raise self._fail(
-                    "no_cover_reply",
-                    "printer did not answer the cover query (busy, or holding a "
-                    "partial job? power-cycle it)",
-                )
-            self._note(f"cover: {cover}")
-            if cover != "CLOSE":
-                raise self._fail("cover_open", f"printer cover is {cover}; close it")
-
             paper = self._ask(tspl.QUERY_PAPER, EventKind.PAPER)
             self._note(f"paper sensor: {paper} (unreliable, not used)")
-
-            if self.printing == "DOING":
-                self._note("realign in progress (DOING without DONE); waiting")
-                if not self._listen(
-                    self.timeouts.realign_wait_s, lambda: self.printing != "DOING"
-                ):
-                    raise self._fail(
-                        "realign_busy",
-                        f"printer still busy after {self.timeouts.realign_wait_s:g} s "
-                        "(DOING without DONE)",
-                    )
-                self._note(f"realign finished ({self.printing})")
-                if self.result.cover != "CLOSE":
-                    raise self._fail(
-                        "cover_open", f"printer cover is {self.result.cover}; close it"
-                    )
+            self._gate()
         except DirectPrintError:
             raise
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -459,6 +582,71 @@ class PrintSession:
         finally:
             self.result.timings["precheck_s"] = round(self.clock() - step, 3)
 
+    def _gate(self) -> None:
+        """Pass only with the cover CLOSE and no realign running or due."""
+        for _ in range(3):
+            if self._realign_state() is not None:
+                self._wait_realign()
+            cover = self._ask_cover()
+            if cover is None:
+                raise self._fail(
+                    "no_cover_reply",
+                    "printer did not answer the cover query (busy, or holding a "
+                    "partial job? power-cycle it)",
+                )
+            self._note(f"cover: {cover}")
+            if cover != "CLOSE":
+                raise self._fail("cover_open", f"printer cover is {cover}")
+            state = self._realign_state()
+            if state is None:
+                self._note("ready: cover CLOSE, no realign running or due")
+                return
+            self._note(f"realign {state} after the cover query; checking again")
+        raise self._fail(
+            "realign_busy", "the cover kept changing while checking the printer"
+        )
+
+    def _wait_realign(self) -> None:
+        """Wait for a running or due realign to report DONE.
+
+        Raises ``realign_busy`` if DONE does not come within
+        ``realign_wait_s``, or if a due realign never starts (no DOING
+        within ``realign_start_s`` of the cover close being seen).
+        """
+        started = self.clock()
+        deadline = started + self.timeouts.realign_wait_s
+        state = self._realign_state()
+        self._note(
+            "realign in progress (DOING without DONE); waiting"
+            if state == "running"
+            else "cover was closed (pushed CLOSE); waiting for the printer's "
+            "realign (DOING/DONE)"
+        )
+        due_since = self.clock()
+        while state is not None:
+            now = self.clock()
+            if now >= deadline:
+                raise self._fail(
+                    "realign_busy",
+                    f"printer still busy after {self.timeouts.realign_wait_s:g} s "
+                    f"(realign {state})",
+                )
+            if state == "due" and now - due_since >= self.timeouts.realign_start_s:
+                raise self._fail(
+                    "realign_busy",
+                    "cover was closed but the printer did not report its realign "
+                    f"within {self.timeouts.realign_start_s:g} s",
+                )
+            self._read(min(self.timeouts.poll_s, deadline - now))
+            new_state = self._realign_state()
+            if new_state == "due" and state != "due":
+                due_since = self.clock()
+            state = new_state
+        self._note(
+            f"realign finished ({self.printing}) after "
+            f"{round(self.clock() - started, 3)} s"
+        )
+
     def probe(self) -> StatusProbe:
         """Drain, then ask SSSGETCAP and SSSGETPAPER only; never raises.
 
@@ -467,10 +655,7 @@ class PrintSession:
         probe = StatusProbe()
         try:
             self._listen(self.timeouts.drain_s)
-            for attempt_no in range(1, self.timeouts.cover_query_attempts + 1):
-                if self._ask(tspl.QUERY_COVER, EventKind.COVER) is not None:
-                    break
-                self._note(f"no cover reply (attempt {attempt_no})", logging.WARNING)
+            self._ask_cover()
             self._ask(tspl.QUERY_PAPER, EventKind.PAPER)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             probe.error = exception_summary(exc)
@@ -497,6 +682,10 @@ class PrintSession:
         """
         self.result.job_bytes = len(job)
         self._note(f"writing job ({len(job)} bytes)")
+        if self._cover_owed:
+            # A late reply may still come; only a CLOSE (no change) can be
+            # taken as that reply during the print.
+            self._note(f"{self._cover_owed} cover reply(ies) still outstanding")
         self._job_started = True
         started = self.clock()
         try:
@@ -557,7 +746,7 @@ class PrintSession:
         return False
 
     def watch(self) -> SessionOutcome:
-        """Follow DOING/DONE after a complete write."""
+        """Follow DOING/DONE after a complete write; confirm the cover after."""
         started = self.clock()
         if not self._listen(self.timeouts.doing_s, lambda: self.result.saw_doing):
             self.result.timings["doing_wait_s"] = round(self.clock() - started, 3)
@@ -577,10 +766,39 @@ class PrintSession:
                 "(jam? paper ran out mid-label?)",
                 logging.ERROR,
             )
-            return self._outcome_with_errors(SessionOutcome.TIMEOUT)
+            return self._outcome_with_errors(self._attributed(SessionOutcome.TIMEOUT))
         self.result.timings["print_s"] = round(self.clock() - doing_at, 3)
         self._note(f"printer finished (DONE after {self.result.timings['print_s']} s)")
-        return self._outcome_with_errors(SessionOutcome.COMPLETED)
+        if not self.result.attribution_problems:
+            self._confirm_cover_after_done()
+        return self._outcome_with_errors(self._attributed(SessionOutcome.COMPLETED))
+
+    def _confirm_cover_after_done(self) -> None:
+        """Ask SSSGETCAP once more: a cover cycle (realign) must not hide.
+
+        The full reply window also catches a late extra DOING / DONE.
+        """
+        step = self.clock()
+        cover = self._ask_cover()
+        self.result.timings["confirm_s"] = round(self.clock() - step, 3)
+        if cover is None:
+            self._unattributable("the cover query after DONE got no reply")
+        elif cover != "CLOSE":
+            self._unattributable(f"the cover is {cover} after DONE")
+        else:
+            self._note("cover still CLOSE after DONE")
+
+    def _attributed(self, outcome: SessionOutcome) -> SessionOutcome:
+        """``outcome``, or UNCERTAIN when DOING/DONE may not be this label's."""
+        if not self.result.attribution_problems:
+            return outcome
+        self._note(
+            f"{outcome.value} cannot be trusted ("
+            + "; ".join(self.result.attribution_problems)
+            + "): check whether the label came out",
+            logging.ERROR,
+        )
+        return SessionOutcome.UNCERTAIN
 
     def _outcome_with_errors(self, outcome: SessionOutcome) -> SessionOutcome:
         if self.result.command_errors and outcome is SessionOutcome.COMPLETED:
@@ -646,7 +864,9 @@ def prepare_job(img_or_raster: ImageOrRaster) -> bytes:
             raster = bytes(img_or_raster)
         rasterized = time.monotonic()
         job = tspl.build_job(raster)
-    except (ValueError, OSError) as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # ValueError / OSError, but also e.g. PIL's DecompressionBombError:
+        # nothing was sent, so every failure here is a clean PrintError.
         log_event(
             logger, logging.ERROR, "cannot build job", error=describe_exception(exc)
         )

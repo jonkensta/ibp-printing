@@ -474,6 +474,7 @@ class FakeWin32(tr.Win32Api):
         self.cancels = 0
         self.waits: list[int] = []
         self.partial_pending = False
+        self.cancel_stuck_writes = False  # like cancel_stuck, writes only
         self.wait_fails = False
         self.async_error: Optional[int] = None
         self.on_write: Optional[Any] = None
@@ -532,14 +533,16 @@ class FakeWin32(tr.Win32Api):
             return False
         room = self.write_capacity - len(self.written)
         if room <= 0:
-            return self._pend(ov)
+            self._pend(ov)
+            self.pending[ov.hEvent]["write"] = True
+            return False
         take = min(room, size)
         self.written.extend(bytes(buffer)[:take])
         if self.on_write is not None:
             self.on_write(bytes(buffer)[:take])
         if take < size and self.partial_pending:
             self._pend(ov)
-            self.pending[ov.hEvent]["n"] = take
+            self.pending[ov.hEvent].update(n=take, write=True)
             return False
         return self._complete(ov, take)
 
@@ -581,7 +584,10 @@ class FakeWin32(tr.Win32Api):
     def cancel_io(self, handle: int, ov: Any) -> bool:
         self.cancels += 1
         entry = self.pending.get(ov.hEvent)
-        if entry and not entry["done"] and not self.cancel_stuck:
+        stuck = self.cancel_stuck or (
+            self.cancel_stuck_writes and entry is not None and entry.get("write")
+        )
+        if entry and not entry["done"] and not stuck:
             entry.update(done=True, ok=False)
         return True
 
