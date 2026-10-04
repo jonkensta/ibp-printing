@@ -1,9 +1,13 @@
 """``ibp-print-diag``: explain which printers are usable and why, and test them.
 
-The default action runs a full discovery pass and prints a report showing,
-for every print queue, each detection gate and its result, followed by every
-USB device that has a VID:PID, the final verdict, recent PrintService events,
-and where the logs live. ``--test-print`` sends a 4x6 test label.
+The default action runs a full discovery pass and prints a report showing
+whether direct USB printing is on, every direct USB printer (path, serial,
+1284 ID, and a label-safe status probe: cover and paper), then for every print
+queue each detection gate and its result, every USB device that has a
+VID:PID, the final verdict, recent PrintService events, and where the logs
+live. ``--test-print`` sends a 4x6 test label (directly over USB when a
+supported printer is plugged in), ``--direct-status`` runs only the direct
+probe, and ``--no-direct`` turns the direct path off for this run.
 """
 
 import argparse
@@ -25,6 +29,10 @@ from ibp_printing.api import (
     print_to_first_available,
 )
 from ibp_printing.backends import PrintError
+from ibp_printing.direct.backend import DirectFirstBackend
+from ibp_printing.direct.config import set_direct_enabled
+from ibp_printing.direct.session import StatusProbe
+from ibp_printing.direct.transport import DirectDevice
 from ibp_printing.log import (
     configure_logging,
     default_log_dir,
@@ -39,6 +47,7 @@ from ibp_printing.models import (
     PrinterCandidate,
     PrintResult,
     UsbDevice,
+    is_supported_direct_model,
 )
 from ibp_printing.winconst import (
     PRINTER_ATTRIBUTE_BITS,
@@ -64,6 +73,7 @@ def build_report(
     events: Sequence[Mapping[str, Any]] = (),
     *,
     log_dir: Optional[Path] = None,
+    probes: Optional[Mapping[str, StatusProbe]] = None,
 ) -> str:
     """Render a human-readable diagnostics report for one discovery pass.
 
@@ -72,6 +82,7 @@ def build_report(
         events: Recent OS print-subsystem events (newest first).
         log_dir: Log directory to point the reader at; defaults to
             :func:`ibp_printing.default_log_dir`.
+        probes: Status probe results by direct device path.
     """
     lines = [
         RULE,
@@ -81,6 +92,9 @@ def build_report(
         RULE,
         "",
     ]
+    if discovery.direct_enabled is not None:
+        lines += direct_section(discovery, probes or {})
+        lines.append("")
     lines += _queue_section(discovery)
     lines.append("")
     lines += _usb_section(discovery.usb_devices)
@@ -112,12 +126,18 @@ def report_data(
     events: Sequence[Mapping[str, Any]] = (),
     *,
     log_dir: Optional[Path] = None,
+    probes: Optional[Mapping[str, StatusProbe]] = None,
 ) -> dict[str, Any]:
     """The same information as :func:`build_report`, as JSON-friendly data."""
     return {
         "host": socket.gethostname(),
         "platform": sys.platform,
         "time": datetime.now().isoformat(timespec="seconds"),
+        "direct_enabled": discovery.direct_enabled,
+        "direct_devices": [
+            _direct_device_data(device, (probes or {}).get(device.path))
+            for device in discovery.direct_devices
+        ],
         "candidates": [candidate.to_log() for candidate in discovery.candidates],
         "usb_devices": [asdict(device) for device in discovery.usb_devices],
         "errors": list(discovery.errors),
@@ -127,12 +147,84 @@ def report_data(
     }
 
 
+def _direct_device_data(
+    device: DirectDevice, probe: Optional[StatusProbe]
+) -> dict[str, Any]:
+    data = device.to_log()
+    data["supported"] = is_supported_direct_model(device.model)
+    data["probe"] = probe.to_log() if probe is not None else None
+    return data
+
+
+def direct_section(
+    discovery: Discovery, probes: Mapping[str, StatusProbe]
+) -> list[str]:
+    """The "Direct USB printers" part of the report."""
+    state = "ON" if discovery.direct_enabled else "OFF (queue-only)"
+    lines = [
+        "-- Direct USB printers (no driver, no print queue) --",
+        f"  direct USB printing: {state}  (IBP_PRINTING_DIRECT=0 turns it off)",
+    ]
+    if not discovery.direct_enabled:
+        return lines
+    by_path = {
+        candidate.direct_device.path: candidate
+        for candidate in discovery.candidates
+        if candidate.direct_device is not None
+    }
+    lines += describe_direct_devices(discovery.direct_devices, probes, by_path)
+    return lines
+
+
+def describe_direct_devices(
+    devices: Sequence[DirectDevice],
+    probes: Mapping[str, StatusProbe],
+    candidates: Optional[Mapping[str, PrinterCandidate]] = None,
+) -> list[str]:
+    """One block per USB printer-class device, with its probe and verdict."""
+    if not devices:
+        return ["  (no USB printer-class devices found)"]
+    lines: list[str] = []
+    for index, device in enumerate(devices, start=1):
+        supported = is_supported_direct_model(device.model)
+        lines += [
+            f"  [{index}] {device.model or '(unknown model)'} at {device.path}",
+            f"        kind={device.kind or '-'} vid_pid={device.vid_pid or '-'} "
+            f"serial={device.serial or '-'} product={device.product or '-'}",
+            f"        1284 ID: {device.ieee1284_raw or '(not read)'}",
+            f"        supported model: {'YES' if supported else 'NO'}  "
+            f"present={device.present} accessible="
+            f"{'-' if device.accessible is None else device.accessible} "
+            f"busy={device.busy}",
+        ]
+        lines += [f"        error: {error}" for error in device.errors]
+        probe = probes.get(device.path)
+        if probe is not None:
+            lines.append(f"        status probe: {probe.summary()}")
+            if probe.lines:
+                lines.append(f"        printer said: {probe.lines}")
+            if probe.cover == "OPEN":
+                lines.append("        -> close the printer cover")
+        candidate = (candidates or {}).get(device.path)
+        if candidate is not None:
+            for reason in candidate.reasons():
+                lines.append(f"        reason: {reason}")
+            lines.append(
+                f"        => usable as {candidate.name!r}: "
+                f"{'YES' if candidate.usable else 'NO'}"
+            )
+    return lines
+
+
 def _queue_section(discovery: Discovery) -> list[str]:
     lines = ["-- Print queues --"]
-    if not discovery.candidates:
+    queues = [
+        candidate for candidate in discovery.candidates if not candidate.is_direct
+    ]
+    if not queues:
         lines.append("  (no print queues found)")
         return lines
-    for index, candidate in enumerate(discovery.candidates, start=1):
+    for index, candidate in enumerate(queues, start=1):
         lines += _describe_candidate(index, candidate)
     return lines
 
@@ -210,7 +302,8 @@ def _verdict_section(discovery: Discovery) -> list[str]:
     if not usable:
         lines.append(f"  (printing would fail with: {NO_PRINTER_MESSAGE!r})")
     for rank, candidate in enumerate(usable, start=1):
-        lines.append(f"  {rank}. {candidate.name}")
+        how = "  [direct USB]" if candidate.is_direct else ""
+        lines.append(f"  {rank}. {candidate.name}{how}")
     return lines
 
 
@@ -357,7 +450,9 @@ def _outcome_text(result: PrintResult) -> str:
         return "PROBLEM: the label may or may not have printed; check the printer"
     if result.outcome is JobOutcome.TRACKING_FAILED:
         return "PROBLEM: spooled, but following the job failed; check the printer"
-    return "PROBLEM"
+    if result.outcome is JobOutcome.TIMEOUT:
+        return "PROBLEM: the printer did not finish in time; check the printer"
+    return "PROBLEM: check the printer"
 
 
 # -- CLI -----------------------------------------------------------------------
@@ -393,23 +488,104 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="print a 4x6 test label to PRINTER (default: best usable printer)",
     )
     parser.add_argument(
+        "--direct-status",
+        action="store_true",
+        help="only list direct USB printers and probe their cover/paper state "
+        "(sends nothing that prints)",
+    )
+    parser.add_argument(
+        "--no-direct",
+        action="store_true",
+        help="turn direct USB printing off for this run (like IBP_PRINTING_DIRECT=0)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="also echo the log to stderr"
     )
     return parser.parse_args(argv)
 
 
+def _direct_layer() -> Optional[DirectFirstBackend]:
+    backend = get_backend()
+    return backend if isinstance(backend, DirectFirstBackend) else None
+
+
+def probe_direct_devices(
+    devices: Sequence[DirectDevice],
+    layer: Optional[DirectFirstBackend] = None,
+) -> dict[str, StatusProbe]:
+    """Probe every supported device (cover/paper queries only), by path."""
+    layer = layer or _direct_layer()
+    if layer is None:
+        return {}
+    return {
+        device.path: layer.probe(device)
+        for device in devices
+        if is_supported_direct_model(device.model)
+    }
+
+
+def run_direct_status(as_json: bool) -> int:
+    """``--direct-status``: list direct devices and probe them; exit code."""
+    layer = _direct_layer()
+    if layer is None:
+        message = "the active backend has no direct USB layer"
+        print(json.dumps({"error": message}) if as_json else message)
+        return 1
+    enabled, why = layer.direct_mode()
+    devices, errors = layer.list_devices()
+    probes = probe_direct_devices(devices, layer)
+    ready = [path for path, probe in probes.items() if probe.ready]
+    log_event(
+        logger,
+        logging.INFO,
+        "direct status",
+        enabled=enabled,
+        decided_by=why,
+        devices=[_direct_device_data(d, probes.get(d.path)) for d in devices],
+        errors=errors,
+    )
+    if as_json:
+        data = {
+            "direct_enabled": enabled,
+            "decided_by": why,
+            "devices": [_direct_device_data(d, probes.get(d.path)) for d in devices],
+            "errors": errors,
+            "ready": ready,
+        }
+        print(json.dumps(data, indent=2, default=repr))
+    else:
+        lines = [
+            "-- Direct USB printers (status probe: SSSGETCAP / SSSGETPAPER only) --",
+            f"  direct USB printing: {'ON' if enabled else 'OFF'} ({why})",
+        ]
+        lines += describe_direct_devices(devices, probes)
+        lines += [f"  error: {error}" for error in errors]
+        lines.append(f"  ready: {len(ready)} of {len(probes)} supported printer(s)")
+        print("\n".join(lines))
+    return 0 if probes and len(ready) == len(probes) else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point for ``ibp-print-diag``. Returns the process exit code."""
     args = _parse_args(argv)
+    if args.no_direct:
+        set_direct_enabled(False)
     log_dir = configure_logging(args.log_dir, app=LOG_APP, console=args.verbose)
+    if args.direct_status:
+        return run_direct_status(args.json)
 
     discovery = discover()
+    probes = (
+        probe_direct_devices(discovery.direct_devices)
+        if discovery.direct_enabled
+        else {}
+    )
     events = (
         get_backend().recent_print_events(minutes=args.events)
         if args.events > 0
         else []
     )
-    report = build_report(discovery, events, log_dir=log_dir)
+    report = build_report(discovery, events, log_dir=log_dir, probes=probes)
     log_event(logger, logging.INFO, "diagnostics report\n" + report)
 
     exit_code = 0
@@ -422,7 +598,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exit_code = 1
 
     if args.json:
-        data = report_data(discovery, events, log_dir=log_dir)
+        data = report_data(discovery, events, log_dir=log_dir, probes=probes)
         if args.test_print is not None:
             data["test_print"] = _result_data(test_result, test_error)
         print(json.dumps(data, indent=2, default=repr))

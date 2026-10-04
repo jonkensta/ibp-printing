@@ -41,7 +41,9 @@ from ibp_printing.direct.config import direct_mode, log_direct_mode
 from ibp_printing.direct.session import (
     DirectPrintError,
     SessionTimeouts,
+    StatusProbe,
     print_label,
+    probe_status,
 )
 from ibp_printing.direct.transport import (
     DirectDevice,
@@ -52,7 +54,12 @@ from ibp_printing.direct.transport import (
 )
 from ibp_printing.discovery import direct_candidates, is_direct_name, merge_direct
 from ibp_printing.log import describe_exception, get_logger, log_event
-from ibp_printing.models import Discovery, PrinterCandidate, PrintResult
+from ibp_printing.models import (
+    Discovery,
+    PrinterCandidate,
+    PrintResult,
+    is_supported_direct_model,
+)
 
 logger = get_logger(__name__)
 
@@ -150,6 +157,44 @@ class DirectFirstBackend(PrinterBackend):
         )
         return discovery
 
+    def list_devices(self) -> tuple[list[DirectDevice], list[str]]:
+        """Every USB printer-class device (any model) and errors; never raises."""
+        try:
+            return list(self._discover_devices()), []
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            log_event(
+                logger,
+                logging.ERROR,
+                "direct USB discovery failed",
+                error=describe_exception(exc),
+            )
+            return [], [f"direct USB discovery failed: {exc!r}"]
+
+    def probe(self, device: DirectDevice) -> StatusProbe:
+        """Label-safe status probe (SSSGETCAP / SSSGETPAPER only); never raises.
+
+        Only supported models are probed: another printer could print the
+        query text.
+        """
+        if not is_supported_direct_model(device.model):
+            return StatusProbe(
+                error=f"not probed: model {device.model or '(unknown)'} is not "
+                "supported (another printer could print the query text)"
+            )
+        try:
+            transport = self._opener(device)
+        except (TransportError, OSError) as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "status probe: cannot open the printer",
+                path=device.path,
+                error=describe_exception(exc),
+            )
+            return StatusProbe(error=f"cannot open {device.path}: {exc}")
+        with transport:
+            return probe_status(transport, timeouts=self.timeouts)
+
     def get_default_printer(self) -> Optional[str]:
         return self.inner.get_default_printer()
 
@@ -211,16 +256,7 @@ class DirectFirstBackend(PrinterBackend):
 
     def _find_direct(self, name: str) -> PrinterCandidate:
         """Rediscover direct devices and return the one called ``name``."""
-        try:
-            devices = self._discover_devices()
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            log_event(
-                logger,
-                logging.ERROR,
-                "direct USB discovery failed",
-                error=describe_exception(exc),
-            )
-            devices = []
+        devices, _ = self.list_devices()
         for candidate in direct_candidates(devices):
             if candidate.name == name:
                 return candidate

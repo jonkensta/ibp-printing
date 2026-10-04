@@ -111,6 +111,8 @@ class Harness:
 
     def _open(self, device: DirectDevice) -> FakeTransport:
         self.opened.append(device)
+        if self.transport.closed:  # a second open: a fresh, ready printer
+            self.transport = printer()
         return self.transport.opener()(device)
 
     @property
@@ -474,21 +476,22 @@ class KillSwitchTests(DirectTestCase):
     def test_mode_is_logged_at_configure_time(self):
         os.environ[direct_config.ENV_VAR] = "off"
         package = logging.getLogger(ibp_log.LOGGER_NAME)
-        before = list(package.handlers)
+        added: list[logging.Handler] = []
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(ibp_log, "_CONFIGURED_DIRS", set()),
         ):
             try:
                 with self.assertLogs(package, logging.INFO) as logs:
+                    inside = list(package.handlers)
                     ibp_log.configure_logging(
                         Path(tmp), app="direct-test", console=False
                     )
+                    added = [h for h in package.handlers if h not in inside]
             finally:
-                for handler in list(package.handlers):
-                    if handler not in before:
-                        package.removeHandler(handler)
-                        handler.close()
+                for handler in added:
+                    package.removeHandler(handler)
+                    handler.close()
         text = "\n".join(logs.output)
         self.assertIn("direct USB printing DISABLED", text)
         self.assertIn("direct.config", text)
