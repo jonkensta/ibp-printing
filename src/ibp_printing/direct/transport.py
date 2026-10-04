@@ -37,6 +37,7 @@ import os
 import re
 import select
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -93,7 +94,9 @@ class DeviceGone(TransportError):
     """The device stopped working (unplugged, I/O error) during I/O.
 
     ``bytes_accepted`` is how much of the current ``write_all`` call the device
-    had accepted before the failure (0 for reads).
+    had accepted before the failure (0 for reads). ``None`` means *unknown*:
+    a write request was in flight when it failed and its byte count cannot be
+    trusted, so part of the data may have reached the printer.
     """
 
     def __init__(
@@ -101,15 +104,30 @@ class DeviceGone(TransportError):
         message: str,
         *,
         path: str = "",
-        bytes_accepted: int = 0,
+        bytes_accepted: Optional[int] = 0,
         os_errno: Optional[int] = None,
         winerror: Optional[int] = None,
+        request_started: bool = True,
     ) -> None:
         super().__init__(message)
         self.path = path
         self.bytes_accepted = bytes_accepted
+        # False when the failing request was refused before it started (so
+        # it transferred nothing).
+        self.request_started = request_started
         self.errno = os_errno
         self.winerror = winerror
+
+
+class IndeterminateIO(DeviceGone):
+    """An overlapped request whose completion could not be confirmed.
+
+    The request was cancelled (or its wait failed) and Windows never
+    reported it finished, so it may still be transferring data. Its buffers
+    are kept alive for the rest of the process (see :data:`ABANDONED`), the
+    transport refuses further I/O, and for a write ``bytes_accepted`` is
+    ``None``: the caller must assume the data may have reached the printer.
+    """
 
 
 class TransportClosed(TransportError):
@@ -1251,14 +1269,72 @@ def _clamp_ms(seconds: float) -> int:
     return max(0, min(int(seconds * 1000), 0x7FFFFFFF))
 
 
+class AbandonedRequests:
+    """Overlapped requests whose completion Windows never confirmed.
+
+    The kernel may still write into (or read from) such a request's buffer
+    and ``OVERLAPPED``, and will signal its event when it finishes, so all
+    three must outlive the transport that started it: closing the device
+    handle is not a completion barrier. This registry lives for the whole
+    process (:data:`ABANDONED`). :meth:`reap` frees an entry only once its
+    event is signalled, i.e. the I/O manager has finished with it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: list[tuple[Win32Api, OVERLAPPED, Any, int, str]] = []
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def add(
+        self, api: "Win32Api", ov: OVERLAPPED, buffer: Any, event: int, op: str
+    ) -> None:
+        """Keep ``ov``, ``buffer`` and ``event`` alive until confirmed complete."""
+        with self._lock:
+            self._items.append((api, ov, buffer, event, op))
+
+    def reap(self) -> int:
+        """Release requests that have completed since; returns how many."""
+        with self._lock:
+            keep = []
+            freed = 0
+            for item in self._items:
+                api, _, _, event, op = item
+                try:
+                    done = api.wait(event, 0) == WAIT_OBJECT_0
+                except Exception:  # pylint: disable=broad-exception-caught
+                    done = False
+                if done:
+                    api.close_handle(event)
+                    freed += 1
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "abandoned request completed; buffers released",
+                        op=op,
+                    )
+                else:
+                    keep.append(item)
+            self._items = keep
+            return freed
+
+
+ABANDONED = AbandonedRequests()
+"""Process-wide home of overlapped requests that never confirmed completion."""
+
+
 class WindowsUsbprintTransport(Transport):
     """A usbprint.sys device interface opened overlapped.
 
     Every ReadFile / WriteFile / DeviceIoControl is overlapped and waited with
     a timeout; on timeout the request is cancelled (CancelIoEx) and its result
     collected, so no call can block forever. A request whose cancellation does
-    not complete within ``CANCEL_GRACE_S`` keeps its buffers alive (leaked on
-    purpose) and the transport refuses further I/O.
+    not complete within ``CANCEL_GRACE_S`` raises :class:`IndeterminateIO`
+    (for a write: ``bytes_accepted=None``, the data may have been sent), its
+    buffers move to the process-wide :data:`ABANDONED` registry (freed only
+    once Windows signals completion) and the transport refuses further I/O.
     """
 
     chunk_size = 4096
@@ -1269,7 +1345,8 @@ class WindowsUsbprintTransport(Transport):
         super().__init__()
         self.path = path
         self._api: Win32Api = api if api is not None else CtypesWin32Api()
-        self._stuck: list[tuple[Any, ...]] = []
+        # Set once a request could not be confirmed finished: no more I/O.
+        self._abandoned: Optional[str] = None
         started = time.monotonic()
         handle = self._api.create_file(path)
         if handle is None:
@@ -1297,16 +1374,18 @@ class WindowsUsbprintTransport(Transport):
 
     def _close_impl(self) -> None:
         self._api.close_handle(self._handle)
+        ABANDONED.reap()
 
     def _check_usable(self) -> None:
         self._check_open()
-        if self._stuck:
+        if self._abandoned is not None:
             raise DeviceGone(
-                f"{self.path}: an earlier request never finished cancelling",
+                f"{self.path}: an earlier {self._abandoned} never finished "
+                "cancelling",
                 path=self.path,
             )
 
-    def _overlapped(
+    def _overlapped(  # pylint: disable=too-many-locals,too-many-branches
         self,
         op: str,
         start: Callable[[OVERLAPPED], bool],
@@ -1315,24 +1394,39 @@ class WindowsUsbprintTransport(Transport):
     ) -> tuple[int, bool]:
         """Run one overlapped request: ``(bytes_transferred, timed_out)``.
 
-        Raises :class:`DeviceGone` for a hard failure.
+        Returns only when Windows confirmed the request finished (completed,
+        or cancelled with its final byte count). Raises:
+
+        * :class:`DeviceGone` when the request could not be started
+          (``request_started=False`` on the exception) or finished with an
+          error;
+        * :class:`IndeterminateIO` when it was started but could not be
+          confirmed finished (cancel not completed, wait failed): its
+          buffers go to :data:`ABANDONED` and this transport is unusable.
         """
         api = self._api
+        ABANDONED.reap()
         event = api.create_event()
         if event is None:
             code = api.last_error()
             raise DeviceGone(
-                f"CreateEventW failed ({code})", path=self.path, winerror=code
+                f"CreateEventW failed ({code})",
+                path=self.path,
+                winerror=code,
+                request_started=False,
             )
         ov = OVERLAPPED()
         ov.hEvent = event
-        leak = False
+        release = True
         try:
             if not start(ov):
                 code = api.last_error()
                 if code != ERROR_IO_PENDING:
-                    raise self._win_dead(op, code)
+                    error = self._win_dead(op, code)
+                    error.request_started = False
+                    raise error
             waited = api.wait(event, _clamp_ms(timeout_s))
+            wait_error = 0
             if waited == WAIT_OBJECT_0:
                 ok, transferred = api.get_overlapped_result(self._handle, ov)
                 if ok:
@@ -1340,11 +1434,13 @@ class WindowsUsbprintTransport(Transport):
                 code = api.last_error()
                 if code == ERROR_OPERATION_ABORTED:
                     return transferred, True
-                raise self._win_dead(op, code)
-            if waited != WAIT_TIMEOUT:
-                code = api.last_error()
-                raise self._win_dead(f"{op} wait", code)
-            # Timed out: cancel and collect the final result.
+                if code != ERROR_IO_INCOMPLETE:
+                    raise self._win_dead(op, code)
+                # Signalled but not complete: should not happen; treat it
+                # like a timeout below (cancel, then confirm).
+            elif waited != WAIT_TIMEOUT:
+                wait_error = api.last_error()
+            # Timed out (or the wait failed): cancel and collect the result.
             cancelled = api.cancel_io(self._handle, ov)
             cancel_error = 0 if cancelled else api.last_error()
             api.wait(event, _clamp_ms(CANCEL_GRACE_S))
@@ -1352,10 +1448,12 @@ class WindowsUsbprintTransport(Transport):
             code = 0 if ok else api.last_error()
             log_event(
                 logger,
-                logging.DEBUG,
-                f"{op} timed out; cancelled",
+                logging.DEBUG if not wait_error else logging.ERROR,
+                f"{op} {'wait failed' if wait_error else 'timed out'}; cancelled",
                 path=self.path,
                 timeout_s=round(timeout_s, 3),
+                wait_result=waited,
+                wait_winerror=wait_error,
                 cancel_ok=cancelled,
                 cancel_winerror=cancel_error,
                 completed=ok,
@@ -1363,22 +1461,37 @@ class WindowsUsbprintTransport(Transport):
                 winerror=code,
             )
             if not ok and code == ERROR_IO_INCOMPLETE:
-                leak = True
-                self._stuck.append((ov, buffer, event))
-                log_event(
-                    logger,
-                    logging.ERROR,
-                    f"{op} did not finish cancelling; abandoning the device",
+                release = False
+                self._abandon(op, ov, buffer, event)
+                raise IndeterminateIO(
+                    f"{op} on {self.path} did not finish cancelling within "
+                    f"{CANCEL_GRACE_S:g} s; it may still complete",
                     path=self.path,
-                    grace_s=CANCEL_GRACE_S,
+                    bytes_accepted=None,
+                    winerror=code,
                 )
-                return 0, True
             if not ok and code not in (ERROR_OPERATION_ABORTED, 0):
                 raise self._win_dead(op, code)
+            if wait_error:
+                raise self._win_dead(f"{op} wait", wait_error)
             return transferred, True
         finally:
-            if not leak:
+            if release:
                 api.close_handle(event)
+
+    def _abandon(self, op: str, ov: OVERLAPPED, buffer: Any, event: int) -> None:
+        """Hand an unconfirmed request's memory to :data:`ABANDONED`."""
+        self._abandoned = op
+        ABANDONED.add(self._api, ov, buffer, event, op)
+        log_event(
+            logger,
+            logging.ERROR,
+            f"{op} did not finish cancelling; abandoning the device (its "
+            "buffers are kept for the life of the process)",
+            path=self.path,
+            grace_s=CANCEL_GRACE_S,
+            abandoned_requests=len(ABANDONED),
+        )
 
     def _win_dead(self, op: str, code: int, accepted: int = 0) -> DeviceGone:
         log_event(
@@ -1396,7 +1509,9 @@ class WindowsUsbprintTransport(Transport):
             winerror=code,
         )
 
-    def write_all(self, data: bytes, timeout_s: float) -> int:
+    def write_all(  # pylint: disable=too-many-locals
+        self, data: bytes, timeout_s: float
+    ) -> int:
         self._check_usable()
         total = len(data)
         started = time.monotonic()
@@ -1430,8 +1545,22 @@ class WindowsUsbprintTransport(Transport):
                     "WriteFile", start, buffer, remaining
                 )
             except DeviceGone as exc:
-                exc.bytes_accepted = sent
+                # A request that never started sent nothing; one that was in
+                # flight (failed or unconfirmed) may have sent part of its
+                # chunk, and Windows' count for it cannot be trusted.
+                started_io = exc.request_started
+                exc.bytes_accepted = None if started_io else sent
                 self.bytes_written += sent
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "write_all failed",
+                    path=self.path,
+                    sent_confirmed=sent,
+                    bytes_accepted=exc.bytes_accepted,
+                    total=total,
+                    request_started=started_io,
+                )
                 raise
             sent += written
             chunks += 1
@@ -1509,7 +1638,7 @@ class WindowsUsbprintTransport(Transport):
             got = self._read_once(max(0.0, remaining))
             reads += 1
             lines = self._lines.take_lines()
-            if self._stuck and not lines:
+            if self._abandoned is not None and not lines:
                 self._log_read_timeout(timeout_s, started, reads)
                 return []
             if not got and not lines:

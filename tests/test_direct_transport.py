@@ -4,6 +4,7 @@
 
 import ctypes
 import errno
+import gc
 import os
 import socket
 import sys
@@ -447,8 +448,13 @@ class FakeWin32(tr.Win32Api):
     """Simulates usbprint.sys overlapped I/O.
 
     ``write_capacity`` bytes are accepted (then writes pend forever);
+    ``partial_pending``: a write that hits the capacity transfers what fits
+    and stays pending (instead of completing short);
     ``incoming`` chunks are returned by reads (reads pend when empty);
-    ``cancel_stuck`` makes cancellation never complete.
+    ``cancel_stuck`` makes cancellation never complete;
+    ``wait_fails``: the next request's first wait returns WAIT_FAILED;
+    ``async_error``: the next write is queued, then completes with this error;
+    ``on_write(data)``: called with every accepted write (to script replies).
     """
 
     def __init__(self) -> None:
@@ -467,6 +473,10 @@ class FakeWin32(tr.Win32Api):
         self._next = 100
         self.cancels = 0
         self.waits: list[int] = []
+        self.partial_pending = False
+        self.wait_fails = False
+        self.async_error: Optional[int] = None
+        self.on_write: Optional[Any] = None
 
     def _new(self) -> int:
         self._next += 1
@@ -508,11 +518,29 @@ class FakeWin32(tr.Win32Api):
         if self.fail_io is not None:
             self.error = self.fail_io
             return False
+        if self.async_error is not None:
+            code, self.async_error = self.async_error, None
+            self.written.extend(bytes(buffer)[: size // 2])
+            self.pending[ov.hEvent] = {
+                "ov": ov,
+                "done": True,
+                "n": size // 2,
+                "ok": False,
+                "code": code,
+            }
+            self.error = tr.ERROR_IO_PENDING
+            return False
         room = self.write_capacity - len(self.written)
         if room <= 0:
             return self._pend(ov)
         take = min(room, size)
         self.written.extend(bytes(buffer)[:take])
+        if self.on_write is not None:
+            self.on_write(bytes(buffer)[:take])
+        if take < size and self.partial_pending:
+            self._pend(ov)
+            self.pending[ov.hEvent]["n"] = take
+            return False
         return self._complete(ov, take)
 
     def read_file(self, handle: int, buffer: Any, size: int, ov: Any) -> bool:
@@ -541,6 +569,10 @@ class FakeWin32(tr.Win32Api):
 
     def wait(self, handle: int, timeout_ms: int) -> int:
         self.waits.append(timeout_ms)
+        if self.wait_fails and timeout_ms != tr._clamp_ms(tr.CANCEL_GRACE_S):
+            self.wait_fails = False
+            self.error = tr.ERROR_INVALID_HANDLE
+            return tr.WAIT_FAILED
         entry = self.pending.get(handle)
         if entry and entry["done"]:
             return tr.WAIT_OBJECT_0
@@ -550,8 +582,12 @@ class FakeWin32(tr.Win32Api):
         self.cancels += 1
         entry = self.pending.get(ov.hEvent)
         if entry and not entry["done"] and not self.cancel_stuck:
-            entry.update(done=True, ok=False, n=0)
+            entry.update(done=True, ok=False)
         return True
+
+    def finish(self, event: int) -> None:
+        """Let a stuck request complete (the kernel finally finishes it)."""
+        self.pending[event].update(done=True, ok=False)
 
     def get_overlapped_result(self, handle: int, ov: Any) -> tuple[bool, int]:
         entry = self.pending[ov.hEvent]
@@ -559,7 +595,7 @@ class FakeWin32(tr.Win32Api):
             self.error = tr.ERROR_IO_INCOMPLETE
             return False, 0
         if not entry["ok"]:
-            self.error = tr.ERROR_OPERATION_ABORTED
+            self.error = entry.get("code", tr.ERROR_OPERATION_ABORTED)
             return False, entry["n"]
         return True, entry["n"]
 
@@ -576,8 +612,17 @@ class WindowsTransportLogicTests(unittest.TestCase):
     def setUp(self):
         quiet_logging(self)
         self.api = FakeWin32()
+        self.abandoned = tr.AbandonedRequests()
+        patcher = mock.patch.object(tr, "ABANDONED", self.abandoned)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.transport = WindowsUsbprintTransport(PRINTER_PATH, api=self.api)
-        self.addCleanup(self.transport.close)
+        self.addCleanup(self._close)
+
+    def _close(self):
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            transport.close()
 
     def test_write_all_in_chunks(self):
         data = bytes(range(256)) * 40  # 10240 bytes -> 3 chunks of <= 4096
@@ -609,10 +654,86 @@ class WindowsTransportLogicTests(unittest.TestCase):
 
     def test_stuck_cancel_abandons_device(self):
         self.api.cancel_stuck = True
-        self.assertEqual(self.transport.read_lines(0.05), [])
-        self.assertEqual(len(self.transport._stuck), 1)
+        with self.assertRaises(tr.IndeterminateIO):
+            self.transport.read_lines(0.05)
+        self.assertEqual(len(self.abandoned), 1)
         with self.assertRaises(DeviceGone):
             self.transport.read_lines(0.05)
+        with self.assertRaises(DeviceGone) as caught:
+            self.transport.write_all(b"x", 0.05)
+        self.assertEqual(caught.exception.bytes_accepted, 0)
+        self.assertEqual(self.api.written, b"")
+
+    def test_unconfirmed_write_is_unknown_not_zero(self):
+        """A chunk still pending after a failed cancel may have been sent."""
+        self.api.write_capacity = 100
+        self.api.partial_pending = True
+        self.api.cancel_stuck = True
+        with self.assertRaises(tr.IndeterminateIO) as caught:
+            self.transport.write_all(b"x" * 1000, 0.05)
+        self.assertIsNone(caught.exception.bytes_accepted)
+        self.assertEqual(len(self.api.written), 100)  # the printer got some
+
+    def test_confirmed_cancel_counts_partial_chunk(self):
+        self.api.write_capacity = 100
+        self.api.partial_pending = True
+        self.assertEqual(self.transport.write_all(b"x" * 1000, 0.05), 100)
+        self.assertEqual(len(self.abandoned), 0)
+
+    def test_abandoned_buffers_outlive_the_transport(self):
+        self.api.write_capacity = 0
+        self.api.cancel_stuck = True
+        with self.assertRaises(tr.IndeterminateIO):
+            self.transport.write_all(b"x" * 10, 0.05)
+        ((_, ov, buffer, event, op),) = self.abandoned._items
+        self.assertEqual(op, "WriteFile")
+        self.transport.close()
+        del self.transport
+        gc.collect()
+        # The kernel may still use them: still referenced, event still open.
+        self.assertEqual(len(self.abandoned), 1)
+        self.assertIn(event, self.api.handles)
+        self.assertEqual(ov.hEvent, event)
+        self.assertEqual(bytes(buffer), b"x" * 10)
+        self.assertEqual(self.abandoned.reap(), 0)
+        self.api.finish(event)
+        self.assertEqual(self.abandoned.reap(), 1)
+        self.assertEqual(len(self.abandoned), 0)
+        self.assertNotIn(event, self.api.handles)
+
+    def test_wait_failure_is_cancelled_and_confirmed(self):
+        self.api.write_capacity = 0
+        self.api.wait_fails = True
+        with self.assertRaises(DeviceGone) as caught:
+            self.transport.write_all(b"x" * 10, 1.0)
+        self.assertNotIsInstance(caught.exception, tr.IndeterminateIO)
+        self.assertEqual(self.api.cancels, 1)
+        self.assertIsNone(caught.exception.bytes_accepted)  # it was in flight
+        self.assertEqual(len(self.abandoned), 0)
+
+    def test_wait_failure_with_stuck_cancel_is_abandoned(self):
+        self.api.write_capacity = 0
+        self.api.wait_fails = True
+        self.api.cancel_stuck = True
+        with self.assertRaises(tr.IndeterminateIO) as caught:
+            self.transport.write_all(b"x" * 10, 1.0)
+        self.assertIsNone(caught.exception.bytes_accepted)
+        self.assertEqual(len(self.abandoned), 1)
+
+    def test_async_write_failure_is_unknown(self):
+        """A queued write that fails: Windows' count is not trusted."""
+        self.api.async_error = tr.ERROR_GEN_FAILURE
+        with self.assertRaises(DeviceGone) as caught:
+            self.transport.write_all(b"x" * 10, 1.0)
+        self.assertIsNone(caught.exception.bytes_accepted)
+        self.assertEqual(caught.exception.winerror, tr.ERROR_GEN_FAILURE)
+
+    def test_refused_write_sent_nothing(self):
+        self.api.fail_io = tr.ERROR_DEVICE_NOT_CONNECTED
+        with self.assertRaises(DeviceGone) as caught:
+            self.transport.write_all(b"x" * 10, 1.0)
+        self.assertEqual(caught.exception.bytes_accepted, 0)
+        self.assertFalse(caught.exception.request_started)
 
     def test_io_error_raises_device_gone(self):
         self.api.write_capacity = 4096
