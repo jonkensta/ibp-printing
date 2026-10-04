@@ -32,9 +32,17 @@ A supported printer connected for **direct USB printing** (the PM2411BT, see
 the README) needs no print queue; the watcher uses it like any other printer
 through the library. Its outcomes map onto the same folders: "nothing sent"
 (printer busy, cover open, not answering) goes to `to-print\`, and anything
-the printer may have partly printed (paper out, no "done" report) goes to
-`check-printer\`. After a paper-out, power-cycle the printer before loading
-paper.
+the printer may have partly printed (paper out, no "done" report, the cover
+opened or closed during the print) goes to `check-printer\`. After a
+paper-out, power-cycle the printer before loading paper.
+
+When the printer's cover is open (or it is still realigning after the cover
+was closed), the label is **not** sent to that printer's Windows print queue
+either: the message box says "Close the label printer's cover." and that the
+label will print automatically once the cover is closed, and the label waits
+in `to-print\` until the next retry finds the printer ready. Likewise, when
+the printer does not answer or does not take the label, the box says to turn
+it off and on again. Other printers (a different model) are still tried.
 
 ## The three folders
 

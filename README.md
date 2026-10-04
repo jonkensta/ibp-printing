@@ -53,7 +53,9 @@ vendor driver. Plug it in and it shows up as e.g.
   Support* driver (`usbprint.sys`) to any USB printer, and the library talks
   to that. If a Windows print queue for the same printer also exists (named
   with the `VID:PID` rule below), it is kept as the fallback, listed after the
-  direct entry.
+  direct entry, and used only when the direct printer could not be opened
+  (busy, permission, unplugged) or failed with an I/O error before sending -
+  never when its cover is open or it is not answering (see below).
 - **Linux:** the printer appears as `/dev/usb/lpN`, which normal users cannot
   open. Install the udev rule once:
   ```sh
@@ -74,11 +76,24 @@ vendor driver. Plug it in and it shows up as e.g.
   is active when logging is configured.
 
 **How fallback works.** `print_to_first_available` tries the direct printer
-first. If the job *definitely* never reached it (printer busy, no permission,
-unplugged, cover open, printer not answering), that is a `PrintError` and the
-next printer is tried - possibly the same printer's Windows queue. Once any
-part of the job has been sent, there is no fallback: the result is returned
-as it is, even when it is not ok.
+first. If the job *definitely* never reached it, that is a `PrintError` and
+the next printer is tried:
+
+- printer busy, no permission, unplugged, or an I/O error before sending:
+  the next printer, possibly the same printer's Windows queue;
+- cover open or the printer still realigning after the cover was closed
+  (`reason` `cover_open` / `realign_busy`), or the printer not answering /
+  not taking the job (`no_cover_reply` / `job_not_accepted`; it may be
+  holding a half job that would swallow the next one): **not** the same
+  printer's Windows queue (same VID:PID). Other printers are still tried. If
+  none is left, the `PrintError` has that `.reason` and a message for the
+  volunteer ("Close the printer cover: ..." / "Turn the label printer off
+  and on again: ..."), so shippy and the label watcher keep the label in
+  `to-print\`, and the watcher prints it once the printer is ready.
+
+Once any part of the job has been sent (or may have been: e.g. a Windows
+write whose cancellation was never confirmed), there is no fallback: the
+result is returned as it is, even when it is not ok.
 
 **What the volunteer sees.** The direct path asks the printer about its cover
 before sending, and the printer reports when it starts and finishes printing:
@@ -86,12 +101,14 @@ before sending, and the printer reports when it starts and finishes printing:
 | Situation | Result | What to do |
 |---|---|---|
 | Label printed | `COMPLETED` (ok) | - |
-| Cover open | `PrintError` "printer cover is OPEN; close it" (nothing sent; another printer is tried, the watcher keeps the label in `to-print\`) | Close the cover; print again. |
+| Cover open, or closed moments ago and the printer is still realigning | `PrintError` "Close the printer cover: ..." (`reason` `cover_open` / `realign_busy`; nothing sent; never sent to the same printer's queue; the watcher keeps the label in `to-print\` and prints it once the cover is closed) | Close the cover. |
+| Printer does not answer or does not take the job | `PrintError` "Turn the label printer off and on again: ..." (`no_cover_reply` / `job_not_accepted`; not sent to the same printer's queue) | Power-cycle the printer. |
+| Cover opened or closed while the label was printing | `UNCERTAIN` (the printer's realign after a cover close reports the same "printing"/"done" as a label, so success cannot be proven) | Check whether the label came out. |
 | Paper out (roll empty or not loaded) | `UNCERTAIN`, history: "printer stopped accepting data (paper out? jam?) - a partial job is in the printer: power-cycle it before reloading paper" | **Turn the printer off and on before** loading paper, otherwise it may print the leftover half job or swallow the next one. Then check whether a label came out before reprinting. |
 | Printer started but did not finish within the wait | `TIMEOUT` | Check for a jam; the label may still come out. |
 | Printer never started (no "printing" report within 10 s) | `UNCERTAIN` | Check the printer; the label may still come out. |
 | Printer rejected part of the job | `ERROR` | The label may be wrong or missing; check it. |
-| Printer busy / unplugged / no permission | `PrintError` (nothing sent) | Fallback as above. |
+| Printer busy / unplugged / no permission | `PrintError` (nothing sent) | Fallback as above, including the same printer's queue. |
 
 The printer's paper sensor is not trusted (it reports paper even with the roll
 removed), so paper out is only noticed when the printer stops taking data.
@@ -189,7 +206,7 @@ ibp_printing.get_default_printer()      # OS default queue name, or None
 | `get_default_printer()` | The OS default printer name. |
 | `configure_logging(log_dir=None, *, app="ibp-printing", console=True, level=DEBUG)` | Attach the file handlers for `printer-<app>.log` / `printer-<app>.jsonl`. It's safe to call more than once and returns the log directory. |
 | `default_log_dir()` | Where logs go by default. |
-| `PrintError` | Raised **only** when the job definitely never reached the spooler (no printer, CreateDC/CreatePrinterDC/StartDoc failed, or a StartPage/draw failure where AbortDoc returned and the queue holds no job with our attempt ID; an `EndPage`/`EndDoc` failure is never a `PrintError`) or the direct USB printer (could not be opened, cover open, no answer, nothing accepted; then it is a `DirectPrintError` with a `.reason` such as `busy`, `permission`, `cover_open`). Safe to retry. Subclass of `RuntimeError`. |
+| `PrintError` | Raised **only** when the job definitely never reached the spooler (no printer, CreateDC/CreatePrinterDC/StartDoc failed, or a StartPage/draw failure where AbortDoc returned and the queue holds no job with our attempt ID; an `EndPage`/`EndDoc` failure is never a `PrintError`) or the direct USB printer (could not be opened, cover open, no answer, nothing accepted; then it is a `DirectPrintError` with a `.reason` such as `busy`, `permission`, `cover_open`, `realign_busy`). Every `PrintError` has `.reason` (None when there is no code); `print_to_first_available` keeps the direct printer's reason when it skipped that printer's own queue. Safe to retry. Subclass of `RuntimeError`. |
 | `PrintResult` | `printer_name`, `job_name`, `job_id` (None for direct USB), `outcome`, `history`, `elapsed_s`. |
 | `JobOutcome` | See [Outcomes](#outcomes). `.ok` is true when a label most likely came out. |
 | `PrinterCandidate`, `PrintQueue`, `UsbDevice` | Discovery records. `candidate.reasons()` explains each check. `candidate.transport` is `"direct"` (USB, `candidate.direct_device` set) or `"queue"`. |

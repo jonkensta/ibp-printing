@@ -16,8 +16,11 @@ Outcome mapping (direct jobs):
 * the device cannot be opened (busy in the spooler or another program, no
   permission, unplugged) or the session's pre-check fails -> ``PrintError``
   (a :class:`~ibp_printing.direct.session.DirectPrintError`): nothing was
-  sent, so ``print_to_first_available`` may try the next candidate (possibly
-  the same printer's Windows queue) and the watcher may queue to to-print/;
+  sent, so ``print_to_first_available`` may try the next candidate and the
+  watcher may queue to to-print/. The same printer's Windows queue is
+  skipped when the reason is in
+  :data:`~ibp_printing.direct.session.NO_SAME_PRINTER_FALLBACK` (cover open,
+  realigning, not answering, not taking data);
 * otherwise a ``PrintResult`` with the session's outcome (COMPLETED,
   UNCERTAIN, TIMEOUT or ERROR) and history. Only COMPLETED is ``ok``; after
   any other outcome nothing is retried or sent elsewhere.

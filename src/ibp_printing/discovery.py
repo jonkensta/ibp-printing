@@ -130,7 +130,8 @@ def merge_direct(discovery: Discovery, devices: list["DirectDevice"]) -> Discove
 
     A queue with the VID:PID of a usable direct candidate is probably the same
     physical printer: it stays a candidate (ranked after the direct one, so it
-    is the fallback when the direct path definitely did not print) and says so.
+    is the fallback when the direct path definitely did not print, except for
+    the reasons in ``direct.session.NO_SAME_PRINTER_FALLBACK``) and says so.
     """
     discovery.direct_devices = list(devices)
     direct = direct_candidates(devices)
@@ -145,7 +146,8 @@ def merge_direct(discovery: Discovery, devices: list["DirectDevice"]) -> Discove
         if twin and not candidate.is_direct:
             note = (
                 f"probably the same printer as {twin!r}; used only if direct "
-                "USB printing definitely did not print"
+                "USB printing could not reach it (never while its cover is "
+                "open or it is not answering)"
             )
             candidate = dataclasses.replace(candidate, notes=candidate.notes + (note,))
         queues.append(candidate)

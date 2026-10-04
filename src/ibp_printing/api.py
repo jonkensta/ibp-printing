@@ -11,6 +11,7 @@ from ibp_printing.direct.config import (  # pylint: disable=unused-import
     direct_enabled,
     set_direct_enabled,
 )
+from ibp_printing.direct.session import NO_SAME_PRINTER_FALLBACK
 from ibp_printing.log import (
     attempt,
     current_attempt_id,
@@ -118,6 +119,15 @@ def print_to_first_available(
     back as ``JobOutcome.UNCERTAIN`` (or TIMEOUT / ERROR) and is never
     re-sent to a second printer.
 
+    When the direct printer refuses because its cover is open or it is still
+    realigning (``reason`` ``cover_open`` / ``realign_busy``), or because it
+    did not answer or take data (``no_cover_reply`` / ``job_not_accepted``:
+    it may hold a partial job that would swallow a queued one), the same
+    physical printer's Windows queue (same VID:PID) is skipped; other
+    printers are still tried. The PrintError then carries that ``reason`` and
+    the volunteer-facing message ("Close the printer cover..."), so callers
+    keep the label (the watcher in ``to-print/``) and print it later.
+
     Raises:
         PrintError: if no printer is usable or every printer definitely failed
             to spool.
@@ -136,7 +146,23 @@ def print_to_first_available(
             raise PrintError("No label printer found plugged in.")
 
         failures: list[str] = []
+        # VID:PIDs of direct printers whose own queue must not be tried.
+        blocked: dict[str, PrintError] = {}
+        first_block: Optional[PrintError] = None
         for index, candidate in enumerate(usable, start=1):
+            twin_of = blocked.get(candidate.vid_pid) if candidate.vid_pid else None
+            if twin_of is not None and not candidate.is_direct:
+                failures.append(f"{candidate.name}: skipped (same printer)")
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "skipping the direct printer's own queue: nothing is sent "
+                    "to the same printer while it refuses",
+                    printer=candidate.name,
+                    vid_pid=candidate.vid_pid,
+                    reason=twin_of.reason,
+                )
+                continue
             log_event(
                 logger,
                 logging.INFO,
@@ -157,13 +183,30 @@ def print_to_first_available(
                     logging.WARNING,
                     "printer failed, trying next",
                     printer=candidate.name,
+                    reason=exc.reason,
                     error=describe_exception(exc),
                 )
+                if candidate.is_direct and exc.reason in NO_SAME_PRINTER_FALLBACK:
+                    first_block = first_block or exc
+                    if candidate.vid_pid:
+                        blocked[candidate.vid_pid] = exc
                 continue
             _log_result(result)
             return result
 
-        raise PrintError("Every label printer failed: " + "; ".join(failures))
+        if first_block is not None:
+            others = [
+                line
+                for line in failures
+                if not line.endswith(("(same printer)", f": {first_block}"))
+            ]
+            message = str(first_block)
+            if others:
+                message += " Other printers also failed: " + "; ".join(others)
+            raise PrintError(message, reason=first_block.reason)
+        raise PrintError(
+            "Every label printer failed: " + "; ".join(failures), reason="all_failed"
+        )
 
 
 def _log_result(result: PrintResult) -> None:

@@ -113,6 +113,8 @@ class Submission:
     kind: str  # "printed", "to_print" (definitely not printed) or "check_printer"
     result: Optional[PrintResult]
     error: str = ""
+    # PrintError.reason for a "to_print" submission (e.g. "cover_open").
+    reason: Optional[str] = None
 
 
 def file_signature(path: Path) -> Optional[tuple[int, int]]:
@@ -695,7 +697,7 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
                     error=describe_exception(exc),
                 )
                 self._release(digest, previous)
-                return Submission("to_print", None, str(exc))
+                return Submission("to_print", None, str(exc), reason=exc.reason)
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 logger.exception(
                     "unexpected error while printing %s; treating as uncertain",

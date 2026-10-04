@@ -8,6 +8,28 @@ from pathlib import Path
 from typing import Optional
 
 _CHECK_PRINTER = "Check that the label printer is plugged in, turned on and has labels."
+
+# PrintError reasons (direct USB printer) that need a specific action. The
+# label is NOT sent to the same printer's print queue for these; it waits in
+# to-print and prints automatically once the printer is ready.
+_ACTIONS = {
+    "cover_open": "Close the label printer's cover.",
+    "realign_busy": (
+        "Close the label printer's cover and leave it closed for a few seconds."
+    ),
+    "no_cover_reply": (
+        "Turn the label printer off, wait a few seconds and turn it on again."
+    ),
+    "job_not_accepted": (
+        "Turn the label printer off, wait a few seconds and turn it on again."
+    ),
+}
+
+
+def _action(reason: Optional[str]) -> str:
+    return _ACTIONS.get(reason or "", _CHECK_PRINTER)
+
+
 _REPRINT = (
     "If you are sure it did NOT print, rename the file so its name starts "
     "with REPRINT (for example REPRINT-label.png) and move it into this "
@@ -20,14 +42,26 @@ def _where(path: Path, moved_to: Optional[Path]) -> str:
 
 
 def did_not_print(
-    path: Path, moved_to: Optional[Path], error: str, to_print: Path
+    path: Path,
+    moved_to: Optional[Path],
+    error: str,
+    to_print: Path,
+    reason: Optional[str] = None,
 ) -> str:
-    """A downloaded label definitely never reached a printer."""
+    """A downloaded label definitely never reached a printer.
+
+    ``reason`` is the PrintError's reason; a cover / not-answering reason
+    replaces the generic advice with what to do.
+    """
     if moved_to is not None:
+        when = (
+            "once the cover is closed"
+            if reason in ("cover_open", "realign_busy")
+            else "as soon as a label printer is working"
+        )
         next_step = (
-            "It will print automatically as soon as a label printer is working, "
-            "while the label watcher is running. You do not need to download it "
-            "again."
+            f"It will print automatically {when}, while the label watcher is "
+            "running. You do not need to download it again."
         )
     else:
         next_step = (
@@ -38,7 +72,7 @@ def did_not_print(
         "The shipping label did NOT print.\n\n"
         f"File: {path.name}\n{_where(path, moved_to)}\n\n"
         f"Problem: {error}\n\n"
-        f"{_CHECK_PRINTER} {next_step}"
+        f"{_action(reason)} {next_step}"
     )
 
 
@@ -71,13 +105,13 @@ def interrupted(
     )
 
 
-def retry_failed(path: Path, error: str) -> str:
+def retry_failed(path: Path, error: str, reason: Optional[str] = None) -> str:
     """A label waiting in to-print still could not be printed."""
     return (
         "A shipping label waiting to be printed still could not be printed.\n\n"
         f"File: {path}\n\n"
         f"Problem: {error}\n\n"
-        f"{_CHECK_PRINTER} The watcher keeps trying automatically; this message "
+        f"{_action(reason)} The watcher keeps trying automatically; this message "
         "is shown only once for this label."
     )
 

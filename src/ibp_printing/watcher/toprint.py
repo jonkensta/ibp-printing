@@ -246,7 +246,9 @@ class ToPrintQueue(WatcherCore):
             level = logging.INFO if filed.status == "printed" else logging.ERROR
             return self._queued_outcome(filed, level)
         self._notify_once(
-            path, "retry_failed", messages.retry_failed(path, submission.error)
+            path,
+            "retry_failed",
+            messages.retry_failed(path, submission.error, reason=submission.reason),
         )
         return self._queued_outcome(
             FileOutcome(

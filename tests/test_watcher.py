@@ -478,6 +478,36 @@ class ProcessingTests(TempDirTest):
             self.assertIn("print automatically", notifier.texts[0])
             self.assertIn(str(outcome.moved_to), notifier.texts[0])
 
+    def test_cover_open_tells_volunteer_to_close_it(self) -> None:
+        ibp_printing.set_backend(FakeBackend())
+        error = PrintError(
+            "Close the printer cover: the label printer's cover is open, so "
+            "nothing was printed.",
+            reason="cover_open",
+        )
+        watcher, notifier = self.make_watcher()
+        with mock.patch(
+            "ibp_printing.watcher.core.api.print_to_first_available",
+            side_effect=error,
+        ):
+            outcome = watcher.process_path(make_label(self.dir / "label.png"))
+        self.assertEqual(outcome.status, "to_print")
+        assert outcome.moved_to is not None
+        self.assertEqual(outcome.moved_to.parent.name, TO_PRINT_DIR)
+        text = notifier.texts[0]
+        self.assertIn("did NOT print", text)
+        self.assertIn("Close the label printer's cover.", text)
+        self.assertIn("print automatically once the cover is closed", text)
+        self.assertNotIn("plugged in", text)
+
+    def test_retry_message_names_the_action(self) -> None:
+        # pylint: disable=import-outside-toplevel
+        from ibp_printing.watcher import messages
+
+        text = messages.retry_failed(Path("x.png"), "no answer", "no_cover_reply")
+        self.assertIn("turn it on again", text)
+        self.assertIn("plugged in", messages.retry_failed(Path("x.png"), "e"))
+
     def test_print_error_when_move_fails_tells_volunteer(self) -> None:
         ibp_printing.set_backend(FakeBackend(printers=0))
         watcher, notifier = self.make_watcher()

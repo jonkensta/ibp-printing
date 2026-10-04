@@ -362,11 +362,73 @@ class FallbackTests(DirectTestCase):
         self.assertIn("Every label printer failed", str(caught.exception))
         self.assertIn("udev", str(caught.exception))
 
-    def test_cover_open_falls_back(self):
+    def only_twin(self, transport: FakeTransport) -> Harness:
+        """The PM2411BT direct plus its own Windows queue, nothing else."""
+        return self.use(
+            Harness(
+                queues=[PrintQueue(TWIN_QUEUE, is_default=True)],
+                usb=[pm_usb()],
+                transport=transport,
+            )
+        )
+
+    def test_cover_open_skips_its_own_queue(self):
         harness = self.twin(transport=printer(cover="OPEN"))
         result = ibp_printing.print_to_first_available(self.img)
-        self.assertEqual(result.printer_name, TWIN_QUEUE)
+        # Another printer is fine; the same printer's queue is not.
+        self.assertEqual(result.printer_name, DYMO_QUEUE)
+        self.assertEqual(harness.queue_prints, [DYMO_QUEUE])
         self.assertNotIn("PRINT 1,1", harness.transport.written_lines)
+
+    def test_cover_open_is_a_print_error_for_the_volunteer(self):
+        harness = self.only_twin(printer(cover="OPEN"))
+        with self.assertRaises(PrintError) as caught:
+            ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(caught.exception.reason, "cover_open")
+        self.assertTrue(str(caught.exception).startswith("Close the printer cover"))
+        self.assertNotIn("Other printers", str(caught.exception))
+        self.assertEqual(harness.queue_prints, [])
+        self.assertNotIn("PRINT 1,1", harness.transport.written_lines)
+
+    def test_realign_busy_is_a_print_error_without_the_queue(self):
+        fake = printer()
+        fake.queue_lines("SSSGETPRINTING:DOING")  # a realign that never ends
+        harness = self.only_twin(fake)
+        with self.assertRaises(PrintError) as caught:
+            ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(caught.exception.reason, "realign_busy")
+        self.assertIn("Close the printer cover", str(caught.exception))
+        self.assertEqual(harness.queue_prints, [])
+
+    def test_no_answer_does_not_use_its_own_queue(self):
+        """It may hold a partial job that would swallow the queue's job."""
+        fake = FakeTransport()  # answers nothing
+        harness = self.only_twin(fake)
+        with self.assertRaises(PrintError) as caught:
+            ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(caught.exception.reason, "no_cover_reply")
+        self.assertIn("off and on", str(caught.exception))
+        self.assertEqual(harness.queue_prints, [])
+
+    def test_job_not_accepted_does_not_use_its_own_queue(self):
+        queries = len(b"SSSGETPAPER\r\n") + len(b"SSSGETCAP\r\n")
+        harness = self.only_twin(printer(stall_after_bytes=queries))
+        with self.assertRaises(PrintError) as caught:
+            ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(caught.exception.reason, "job_not_accepted")
+        self.assertEqual(harness.queue_prints, [])
+
+    def test_not_found_and_io_errors_still_use_its_own_queue(self):
+        gone = DeviceUnavailable("unplugged", reason="not_found", path="x")
+        harness = self.only_twin(printer(raise_on_open=gone))
+        result = ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(result.printer_name, TWIN_QUEUE)
+
+        broken = printer(read_error=tr.DeviceGone("read failed"))
+        harness = self.only_twin(broken)
+        result = ibp_printing.print_to_first_available(self.img)
+        self.assertEqual(result.printer_name, TWIN_QUEUE)
+        self.assertEqual(harness.queue_prints, [TWIN_QUEUE])
 
     def test_no_fallback_after_uncertain_write_stall(self):
         # Paper out: the printer stops taking data part-way through the job.

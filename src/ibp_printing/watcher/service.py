@@ -692,7 +692,13 @@ class LabelWatcher(ToPrintQueue):
         self._notify_once(
             moved_to or path,
             "did_not_print",
-            messages.did_not_print(path, moved_to, submission.error, self.to_print_dir),
+            messages.did_not_print(
+                path,
+                moved_to,
+                submission.error,
+                self.to_print_dir,
+                reason=submission.reason,
+            ),
         )
         note = (
             "; queued in to-print/ for automatic retry"
