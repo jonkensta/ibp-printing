@@ -60,8 +60,14 @@ def setUpModule() -> None:  # pylint: disable=invalid-name
 # Module-level so the "spawn" start method (Windows) can import them.
 
 
-def _child_writer(journal: str, prefix: str, count: int, start: Any) -> None:
+def _quiet_child(journal: str) -> None:
+    # No handlers in a spawned child: keep log records off stderr.
+    logging.getLogger("ibp_printing").addHandler(logging.NullHandler())
     labels.set_journal_path(Path(journal))
+
+
+def _child_writer(journal: str, prefix: str, count: int, start: Any) -> None:
+    _quiet_child(journal)
     labels.LOCK_TIMEOUT_S = 30.0
     start.wait(30)
     for number in range(count):
@@ -73,7 +79,7 @@ def _child_writer(journal: str, prefix: str, count: int, start: Any) -> None:
 
 
 def _child_holder(journal: str, holding: Any, release: Any) -> None:
-    labels.set_journal_path(Path(journal))
+    _quiet_child(journal)
     with labels._locked():
         holding.set()
         release.wait(30)
