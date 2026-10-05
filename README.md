@@ -20,7 +20,10 @@ place that:
 - **tracks** the spooled job until it prints, errors, is deleted, or times out;
 - **logs everything** (queues, USB devices, every GDI step, job status changes,
   PrintService events) to a human-readable log and a JSON-lines log, so a
-  failed label can be diagnosed after the fact.
+  failed label can be diagnosed after the fact;
+- **remembers recent labels** in a shared per-user journal, so an app can warn
+  a volunteer before buying postage twice for the same recipient (see
+  [Duplicate-purchase protection](#duplicate-purchase-protection)).
 
 ## Install
 
@@ -210,6 +213,9 @@ ibp_printing.get_default_printer()      # OS default queue name, or None
 | `PrintResult` | `printer_name`, `job_name`, `job_id` (None for direct USB), `outcome`, `history`, `elapsed_s`. |
 | `JobOutcome` | See [Outcomes](#outcomes). `.ok` is true when a label most likely came out. |
 | `PrinterCandidate`, `PrintQueue`, `UsbDevice` | Discovery records. `candidate.reasons()` explains each check. `candidate.transport` is `"direct"` (USB, `candidate.direct_device` set) or `"queue"`. |
+| `save_for_retry(img, name, *, watch_dir=None, meta=None)` | Save a label that could not be printed into `<Downloads>/to-print/` for the label watcher; returns its path. With `meta`, also writes the sidecar `<png>.json` and marks the label `queued` in the journal (see below). |
+| `downloads_dir()` / `to_print_dir(watch_dir=None)` | The (redirection-aware) Downloads folder, and its `to-print` subfolder. |
+| `recipient_key`, `record_purchase`, `update_status`, `find_duplicates`, `pending_labels`, `LabelRecord`, `LabelStatus` | The label journal; see [Duplicate-purchase protection](#duplicate-purchase-protection). |
 | `get_backend()` / `set_backend(backend)` | Access or replace the backend (`PrinterBackend`), for example with a fake in tests. The default is a `DirectFirstBackend` (direct USB) around the platform backend; a backend passed to `set_backend` replaces both. |
 
 With `track_timeout_s > 0` the Windows backend polls the spooler for the job
@@ -240,6 +246,82 @@ within 10 s.
 Every non-ok outcome means "the label may or may not come out": tell the user
 to check the printer before reprinting. Never refund or resend automatically;
 `print_to_first_available` never sends such a job to a second printer.
+
+## Duplicate-purchase protection
+
+When a label can't print, shippy and shippy-gui save it into
+`Downloads\to-print\` and the [label watcher](#label-watcher) prints it later.
+Volunteers then often enter the same shipment again and buy postage a second
+time. `ibp_printing.labels` (everything is also importable from
+`ibp_printing`) keeps a shared, per-user record of recent labels so the apps
+can warn first:
+
+```python
+import ibp_printing
+from ibp_printing import LabelStatus
+
+key = ibp_printing.recipient_key(name, street, city, state, zip_code)
+
+# Before buying: anything recent (or still waiting) for this recipient?
+for dup in ibp_printing.find_duplicates(key, within_hours=12):   # newest first
+    print(dup.recipient_label, dup.tracking_code, dup.status, dup.file)
+
+# Right after buying:
+ibp_printing.record_purchase(recipient_key=key, recipient_label="Jane Doe, Huntsville TX",
+                             tracking_code=shipment.tracking_code,
+                             shipment_id=shipment.id, app="shippy")
+
+# After trying to print:
+ibp_printing.update_status(shipment.tracking_code, LabelStatus.PRINTED)
+# ...or, if no printer took it, save it for the watcher with its metadata:
+ibp_printing.save_for_retry(label, shipment.tracking_code, meta={
+    "tracking_code": shipment.tracking_code, "shipment_id": shipment.id,
+    "recipient_label": "Jane Doe, Huntsville TX", "recipient_key": key,
+    "app": "shippy"})
+# ...or, if it may have printed:  update_status(code, LabelStatus.CHECK_PRINTER)
+# ...or, after a refund:          update_status(code, LabelStatus.REFUNDED)
+
+# A UI listing what is waiting for the printer (or for a human):
+for waiting in ibp_printing.pending_labels():   # oldest first
+    print(waiting.recipient_label, waiting.status, waiting.file)
+```
+
+| Name | What it is |
+|---|---|
+| `recipient_key(name, street, city, state, zip_code)` | A normalized text key for a recipient (`"jane doe\|1 main st apt 5\|huntsville\|tx\|77340"`): case, accents, punctuation and spacing are ignored; `Street`/`st`, `Avenue`/`ave`, `Apartment`/`Unit`/`Suite`/`#`/`apt`, `P.O. Box`/`po box`, `North`/`n`, `Fort`/`ft`, `Saint`/`st` and state names/codes are folded together; only the first 5 ZIP digits count. The same in every process. |
+| `LabelRecord` | `tracking_code`, `shipment_id`, `recipient_key`, `recipient_label` (e.g. `"Jane Doe, Huntsville TX"`), `app`, `status`, `created`, `updated` (epoch seconds), `file` (the queued / check-printer PNG, or None). |
+| `LabelStatus` | A `StrEnum` (members are plain strings; also module constants `labels.PURCHASED` etc.): `purchased`, `printed`, `queued` (waiting in `to-print\`), `check_printer` (may have printed; needs a human), `refunded`. |
+| `record_purchase(*, recipient_key, recipient_label, tracking_code, shipment_id, app)` | Record a label just bought (status `purchased`); returns the `LabelRecord`. |
+| `update_status(tracking_code, status, *, file=None)` | Record a new status (and file; `None` keeps the recorded one). An unknown label gets a minimal record; an unchanged status and file writes nothing. |
+| `find_duplicates(recipient_key, *, within_hours=12)` | `queued` / `check_printer` labels of **any age** whose file still exists (or that have no file), including PNGs in `to-print\` the journal does not know (from their sidecar), plus `purchased` / `printed` labels updated within the window. Never `refunded`. Newest first. |
+| `pending_labels()` | `queued` and `check_printer` labels whose file still exists, plus **every** PNG in `Downloads\to-print\` the journal does not point at (described by its journal record via the sidecar's tracking code, else by the sidecar, else a minimal record whose `tracking_code` is guessed from the file name and whose `recipient_label` is the file name). Oldest first. |
+| `labels.update_status_from_meta(meta, status, *, file=None)` | `update_status` for a label described by sidecar metadata; creates the record from `meta` when the journal has none (used by `save_for_retry` and the watcher). |
+| `labels.journal_path()` / `labels.set_journal_path(path)` | Where the journal is; override it (tests, tools). |
+
+**Sidecars.** `save_for_retry(..., meta={...})` writes `<label>.png.json` (keys
+`tracking_code`, `shipment_id`, `recipient_label`, `recipient_key`, `app`,
+`created`) atomically **before** the PNG appears, so the watcher always sees a
+label's metadata with it. The watcher never prints a `*.json`, moves the sidecar
+along with its label (`printed\`, `check-printer\`, `duplicate_...` names),
+updates the journal (`printed` / `check_printer` / `queued`), and tells the
+volunteer in one information box per pass: "Label for Jane Doe, Huntsville TX
+(tracking 9400...) printed."
+
+**Storage.** One journal per user: `%LOCALAPPDATA%\ibp-printing\labels.jsonl`
+(Linux: `$XDG_STATE_HOME/ibp-printing/labels.jsonl`, default
+`~/.local/state/...`), next to the watcher's state file. It is append-only JSON
+lines; the last line for a tracking code wins. Every read and write takes an
+OS file lock (`labels.jsonl.lock`, `msvcrt.locking` / `fcntl.flock`, 5 s
+timeout), so the apps and the watcher can use it at the same time. A corrupt
+or half-written line is logged and skipped. About once a day a write compacts
+the file to one line per label and drops labels not updated for 30 days (a
+`queued` / `check_printer` label whose file still exists is kept).
+
+**It never blocks printing.** None of these functions raises for a journal
+problem (lock timeout, disk full, corrupt file, unknown status): it is logged
+at ERROR, `find_duplicates` returns `[]` (with a WARNING saying the check is
+unavailable), `record_purchase` still returns the record, and
+`save_for_retry` still saves the label.
 
 ## Diagnostics CLI
 

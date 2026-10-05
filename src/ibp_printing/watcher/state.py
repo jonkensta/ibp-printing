@@ -32,7 +32,6 @@ as "no history"; it never stops the watcher.
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -41,6 +40,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ibp_printing.log import describe_exception, get_logger, log_event
+from ibp_printing.paths import (  # pylint: disable=unused-import
+    default_state_dir,  # re-exported: it moved to ibp_printing.paths
+)
 
 logger = get_logger(__name__)
 
@@ -62,21 +64,6 @@ _FOLDER_FIELDS = {
     "updated_local",
     "clean_shutdown",
 }
-
-
-def default_state_dir() -> Path:
-    """Fixed per-user folder for the lock and state file.
-
-    ``%LOCALAPPDATA%\\ibp-printing`` on Windows, ``$XDG_STATE_HOME/ibp-printing``
-    (default ``~/.local/state/ibp-printing``) elsewhere. Deliberately independent
-    of ``--log-dir`` and ``--watch-dir``, so two watchers for one user always
-    contend for the same lock.
-    """
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(base) / "ibp-printing"
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(base) / "ibp-printing"
 
 
 def iso(timestamp: Optional[float]) -> Optional[str]:
