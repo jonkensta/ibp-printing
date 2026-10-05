@@ -464,8 +464,20 @@ class PrintSession:
         started = self.clock()
         try:
             accepted = self.transport.write_all(query, self.timeouts.query_write_s)
-        except OSError as exc:  # EAGAIN and friends, if the transport lets them out
-            accepted = 0
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if getattr(exc, "bytes_accepted", 0) is not None and not isinstance(
+                exc, OSError
+            ):
+                raise
+            if isinstance(exc, OSError):  # EAGAIN and friends
+                accepted = 0
+            else:
+                # Cancelled after it started (Windows): any prefix of the
+                # query may be in the printer's line buffer. End it before the
+                # next line and treat its echo as harmless.
+                accepted = 0
+                self._line_dirty = True
+                self._partial_queries.append(query.lstrip(b"\r\n"))
             self._note(
                 f"{name}: write failed, printer busy? ({exception_summary(exc)})",
                 logging.WARNING,

@@ -12,7 +12,9 @@ Every transport has the same small contract (:class:`Transport`):
 * ``write_all(data, timeout_s) -> int`` writes as much as the printer accepts
   before the timeout and returns the count. A printer that stops accepting
   data (paper out, jam) is *not* an exception: the caller compares the count
-  with ``len(data)``. Only a dead or closed device raises.
+  with ``len(data)``. A dead or closed device raises; so does a Windows
+  write whose count Windows cannot vouch for (cancelled after it started:
+  ``bytes_accepted=None``, assume data was sent).
 * ``read_lines(timeout_s) -> list[str]`` returns complete lines the printer
   sent (decoded latin-1, terminators removed). It keeps polling through empty
   reads until at least one line is complete or the timeout passes; partial
@@ -127,6 +129,16 @@ class IndeterminateIO(DeviceGone):
     are kept alive for the rest of the process (see :data:`ABANDONED`), the
     transport refuses further I/O, and for a write ``bytes_accepted`` is
     ``None``: the caller must assume the data may have reached the printer.
+    """
+
+
+class WriteCountUnknown(DeviceGone):
+    """A write request was cancelled (aborted) after it had started.
+
+    Windows confirmed the request is finished, but the byte count of a
+    failed request is not trustworthy (``GetOverlappedResult`` returning
+    FALSE), so part of the data may have reached the printer even when the
+    count says 0: ``bytes_accepted`` is None. The transport stays usable.
     """
 
 
@@ -296,9 +308,12 @@ class Transport(abc.ABC):
         """Write ``data``; return how many bytes the device accepted.
 
         Returns early (with fewer than ``len(data)`` bytes) when the device
-        stops accepting data for ``timeout_s`` seconds overall. Never raises
-        on a timeout; raises :class:`DeviceGone` for a dead device and
-        :class:`TransportClosed` after ``close()``.
+        stops accepting data for ``timeout_s`` seconds overall. Raises
+        :class:`DeviceGone` for a dead device, :class:`TransportClosed` after
+        ``close()``, and on Windows :class:`WriteCountUnknown` /
+        :class:`IndeterminateIO` (``bytes_accepted=None``) when a timed-out
+        request was cancelled after it started, because its count cannot be
+        trusted: the caller must assume part of the data was sent.
         """
 
     @abc.abstractmethod
@@ -1391,8 +1406,14 @@ class WindowsUsbprintTransport(Transport):
         start: Callable[[OVERLAPPED], bool],
         buffer: Any,
         timeout_s: float,
+        *,
+        trust_aborted_count: bool = True,
     ) -> tuple[int, bool]:
         """Run one overlapped request: ``(bytes_transferred, timed_out)``.
+
+        With ``trust_aborted_count=False`` (writes) a request that ended
+        aborted raises :class:`WriteCountUnknown` instead of returning its
+        (untrustworthy) count; only a successful completion's count is used.
 
         Returns only when Windows confirmed the request finished (completed,
         or cancelled with its final byte count). Raises:
@@ -1433,6 +1454,8 @@ class WindowsUsbprintTransport(Transport):
                     return transferred, False
                 code = api.last_error()
                 if code == ERROR_OPERATION_ABORTED:
+                    if not trust_aborted_count:
+                        raise self._count_unknown(op, transferred)
                     return transferred, True
                 if code != ERROR_IO_INCOMPLETE:
                     raise self._win_dead(op, code)
@@ -1474,10 +1497,28 @@ class WindowsUsbprintTransport(Transport):
                 raise self._win_dead(op, code)
             if wait_error:
                 raise self._win_dead(f"{op} wait", wait_error)
+            if not ok and not trust_aborted_count:
+                raise self._count_unknown(op, transferred)
             return transferred, True
         finally:
             if release:
                 api.close_handle(event)
+
+    def _count_unknown(self, op: str, reported: int) -> WriteCountUnknown:
+        log_event(
+            logger,
+            logging.ERROR,
+            f"{op} was aborted after it started; its byte count is not trusted",
+            path=self.path,
+            reported_bytes=reported,
+        )
+        return WriteCountUnknown(
+            f"{op} on {self.path} was cancelled after it started (reported "
+            f"{reported} bytes); part of the data may have been sent",
+            path=self.path,
+            bytes_accepted=None,
+            winerror=ERROR_OPERATION_ABORTED,
+        )
 
     def _abandon(self, op: str, ov: OVERLAPPED, buffer: Any, event: int) -> None:
         """Hand an unconfirmed request's memory to :data:`ABANDONED`."""
@@ -1542,7 +1583,7 @@ class WindowsUsbprintTransport(Transport):
 
             try:
                 written, timed_out = self._overlapped(
-                    "WriteFile", start, buffer, remaining
+                    "WriteFile", start, buffer, remaining, trust_aborted_count=False
                 )
             except DeviceGone as exc:
                 # A request that never started sent nothing; one that was in

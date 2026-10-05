@@ -695,8 +695,56 @@ class WindowsAmbiguousCancelTests(unittest.TestCase):
             self.transport, WHITE, job_name="win", timeouts=self.timeouts
         )
         self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
-        self.assertEqual(result.bytes_written, 100)
+        self.assertEqual(result.bytes_written, -1)  # count not trusted
         self.assertEqual(len(self.abandoned), 0)
+
+    def test_aborted_first_chunk_reporting_zero_is_uncertain(self):
+        """Not job_not_accepted: 100 bytes left even though the abort says 0."""
+        self.api.abort_reports_zero = True
+        result = print_label(
+            self.transport, WHITE, job_name="win", timeouts=self.timeouts
+        )
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertEqual(result.bytes_written, -1)
+
+    def test_job_refused_before_starting_is_a_print_error(self):
+        """Only a write refused before any I/O started is 'nothing sent'."""
+        original = self.api.on_write
+
+        def answer(data: bytes) -> None:
+            original(data)
+            if data.lstrip(b"\r\n") == CAP:
+                self.api.fail_io = self.tr.ERROR_GEN_FAILURE
+
+        self.api.on_write = answer
+        with self.assertRaises(DirectPrintError) as caught:
+            print_label(self.transport, WHITE, job_name="win", timeouts=self.timeouts)
+        self.assertEqual(caught.exception.reason, "transport_error")
+
+    def test_aborted_query_is_not_fatal(self):
+        """A cancelled query write: end the fragment, ask again."""
+        calls = {"n": 0}
+        original_write = self.api.write_file
+
+        def write_file(handle, buffer, size, ov):
+            calls["n"] += 1
+            if calls["n"] == 1:  # the paper query pends and is aborted
+                self.api._pend(ov)  # pylint: disable=protected-access
+                self.api.pending[ov.hEvent]["write"] = True
+                return False
+            return original_write(handle, buffer, size, ov)
+
+        self.api.write_file = write_file  # type: ignore[method-assign]
+        self.api.partial_pending = False
+        self.api.write_capacity = 1 << 30
+        result = print_label(
+            self.transport, WHITE, job_name="win", timeouts=self.timeouts
+        )
+        # It got past the pre-check (no DOING in the fake -> UNCERTAIN).
+        self.assertIs(result.outcome, SessionOutcome.UNCERTAIN, result.history)
+        self.assertTrue(any("SSSGETPAPER: write failed" in h for h in result.history))
+        self.assertIn(b"\r\nSSSGETCAP\r\n", bytes(self.api.written))
+        self.assertIn(b"SIZE 102 mm", bytes(self.api.written))
 
 
 class ProbeTests(SessionTestCase):

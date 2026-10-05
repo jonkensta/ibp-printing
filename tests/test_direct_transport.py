@@ -475,6 +475,8 @@ class FakeWin32(tr.Win32Api):
         self.waits: list[int] = []
         self.partial_pending = False
         self.cancel_stuck_writes = False  # like cancel_stuck, writes only
+        self.abort_reports_zero = False  # an aborted request reports 0 bytes
+        self.cancel_completes = False  # the request finishes OK during cancel
         self.wait_fails = False
         self.async_error: Optional[int] = None
         self.on_write: Optional[Any] = None
@@ -588,7 +590,9 @@ class FakeWin32(tr.Win32Api):
             self.cancel_stuck_writes and entry is not None and entry.get("write")
         )
         if entry and not entry["done"] and not stuck:
-            entry.update(done=True, ok=False)
+            entry.update(done=True, ok=self.cancel_completes)
+            if self.abort_reports_zero:
+                entry["n"] = 0
         return True
 
     def finish(self, event: int) -> None:
@@ -636,11 +640,33 @@ class WindowsTransportLogicTests(unittest.TestCase):
         self.assertEqual(bytes(self.api.written), data)
         self.assertEqual(self.api.cancels, 0)
 
-    def test_write_stall_cancels_and_returns_count(self):
+    def test_write_stall_cancelled_count_is_unknown(self):
+        """An aborted write's count is never trusted, even after full chunks."""
         self.api.write_capacity = 5000
-        accepted = self.transport.write_all(b"x" * 10000, 0.2)
-        self.assertEqual(accepted, 5000)
+        with self.assertRaises(tr.WriteCountUnknown) as caught:
+            self.transport.write_all(b"x" * 10000, 0.2)
+        self.assertIsNone(caught.exception.bytes_accepted)
         self.assertEqual(self.api.cancels, 1)
+        # Not abandoned: Windows confirmed the request finished.
+        self.assertEqual(len(self.abandoned), 0)
+        self.api.incoming = [b"OK\r\n"]
+        self.assertEqual(self.transport.read_lines(1.0), ["OK"])
+
+    def test_aborted_first_chunk_reporting_zero_is_unknown(self):
+        """Codex: 100 bytes went out, the abort reports 0 -> not 'nothing sent'."""
+        self.api.write_capacity = 100
+        self.api.partial_pending = True
+        self.api.abort_reports_zero = True
+        with self.assertRaises(tr.WriteCountUnknown) as caught:
+            self.transport.write_all(b"x" * 1000, 0.05)
+        self.assertIsNone(caught.exception.bytes_accepted)
+        self.assertEqual(len(self.api.written), 100)
+
+    def test_request_completing_during_cancel_is_counted(self):
+        self.api.write_capacity = 100
+        self.api.partial_pending = True
+        self.api.cancel_completes = True
+        self.assertEqual(self.transport.write_all(b"x" * 1000, 0.05), 100)
 
     def test_read_lines_and_timeout(self):
         self.api.incoming = [b"SSSGETCAP:OP", b"EN\r\nSSSGETPRINTING:DO"]
@@ -680,10 +706,11 @@ class WindowsTransportLogicTests(unittest.TestCase):
         self.assertIsNone(caught.exception.bytes_accepted)
         self.assertEqual(len(self.api.written), 100)  # the printer got some
 
-    def test_confirmed_cancel_counts_partial_chunk(self):
+    def test_confirmed_cancel_of_partial_chunk_is_unknown(self):
         self.api.write_capacity = 100
         self.api.partial_pending = True
-        self.assertEqual(self.transport.write_all(b"x" * 1000, 0.05), 100)
+        with self.assertRaises(tr.WriteCountUnknown):
+            self.transport.write_all(b"x" * 1000, 0.05)
         self.assertEqual(len(self.abandoned), 0)
 
     def test_abandoned_buffers_outlive_the_transport(self):
@@ -904,10 +931,12 @@ class RealWindowsTests(unittest.TestCase):
         reading.GetOverlappedResult(True)
         self.assertEqual(reading.getbuffer(), b"SSSGETCAP\r\n")
 
-        # Nobody reads: the write stalls and returns a short count.
+        # Nobody reads: the write stalls, is cancelled, and its count is
+        # not trusted (it may have sent part of the data).
         started = time.monotonic()
-        accepted = transport.write_all(b"x" * (1 << 20), 0.5)
-        self.assertLess(accepted, 1 << 20)
+        with self.assertRaises(tr.WriteCountUnknown) as caught:
+            transport.write_all(b"x" * (1 << 20), 0.5)
+        self.assertIsNone(caught.exception.bytes_accepted)
         self.assertLess(time.monotonic() - started, 10)
 
 
