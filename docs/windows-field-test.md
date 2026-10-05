@@ -1,9 +1,12 @@
 # Windows field test: direct USB printing (PM2411BT)
 
+> Tests ibp-printing commit `2406c4a` (`2406c4ae84f32ed2901e0758c1ec5779cc1e4ce8`, branch `feat/direct-usb`).
+> Every command below is pinned to it, so the code cannot change under you.
+
 For the volunteer coordinator, on one IBP shipping PC. Takes about 20 minutes.
 **Nothing here is installed permanently. Nothing here changes how the normal
-IBP shipping app works.** The test code runs from the `feat/direct-usb` branch;
-IBP's day-to-day apps (`main`) are not touched.
+IBP shipping app works.** The test code runs from one fixed commit of the
+`feat/direct-usb` branch; IBP's day-to-day apps (`main`) are not touched.
 
 ## Before you start
 
@@ -15,7 +18,7 @@ IBP's day-to-day apps (`main`) are not touched.
   makes a `diag` shortcut and a results folder, for this window only:
 
 ```powershell
-function diag { uvx --from "git+https://github.com/jonkensta/ibp-printing@feat/direct-usb" ibp-print-diag @args }
+function diag { uvx --from "git+https://github.com/jonkensta/ibp-printing@2406c4ae84f32ed2901e0758c1ec5779cc1e4ce8" ibp-print-diag @args }
 New-Item -ItemType Directory -Force "$HOME\Desktop\ibp-test" | Out-Null
 ```
 
@@ -33,15 +36,23 @@ In the first output, find the block for `vid_pid=2E3C:5760`:
 
 | You see | Means | Do |
 |---|---|---|
-| `PM2411BT at ...`, `status probe: cover CLOSE ...`, `ready: 1 of 1` | **Good**: Windows lets us open it and it answers | Go on. Write down the line under *Verdict* in the second output, e.g. `PM2411BT (USB direct, serial Q529...)` |
-| `(unknown model)`, `busy=True`, error `in use by another program or the Windows spooler` | **Busy**: something else holds the printer | See *If busy* below |
+| `PM2411BT at ...`, `status probe: cover CLOSE ...`, `ready: 1 of 1` | **Good**: Windows lets us open it and it answers | Go on. Write down the `printer name:` line, e.g. `PM2411BT (USB direct, serial Q529...)` |
+| `PM2411BT (probably) - BUSY: another program or the Windows print queue has it open` | **Busy**: something else holds the printer | See *If busy* below |
 | `PM2411BT ...`, `cover no reply` or `probe failed: ...` | **No reply**: opened, but no answer | Turn the printer off and on, wait 10 s, run the first command once more. Record both results. |
 | `cover OPEN` | Cover not latched | Close it firmly, wait 10 s, run again |
 | No block with `2E3C:5760` | Windows does not see it as a USB printer | Check cable; record and skip to Step 5 |
 
-**Pushed replies:** open the cover, close it, wait 10 s, run
-`diag --direct-status` again. Record whether the `printer said:` line includes
-`SSSGETPRINTING:DOING` / `DONE` (the printer's realign; uses no label).
+**Pushed replies (only if Good):** run this, then within 30 s **open the
+cover, wait 3 s, close it**, and wait for the command to finish:
+
+```powershell
+diag --listen 30 | Tee-Object "$HOME\Desktop\ibp-test\1-listen.txt"
+```
+
+It sends only the cover question (no label). Record whether these lines
+appear: `SSSGETCAP:OPEN`, `SSSGETCAP:CLOSE`, then `SSSGETPRINTING:DOING` and
+`SSSGETPRINTING:DONE` (the printer's realign after the cover closes; it may
+feed a little paper, no label is printed). Ctrl+C stops it early.
 
 **If busy**, try in order, re-running `diag --direct-status` after each:
 
@@ -58,33 +69,37 @@ In the first output, find the block for `vid_pid=2E3C:5760`:
    printer or re-run the vendor installer, restore the exact name) and confirm
    the normal app still prints - the normal IBP app needs that queue.
 
-If it is still busy, record which steps you tried and go to Step 3.
+If it becomes Good, do the *Pushed replies* check. If it is still busy, record
+which steps you tried and go to Step 3.
 
 ## Step 2: one direct test print (1 label)
 
-Only if Step 1 was **Good**. Use the exact name from *Verdict* (so it cannot
-silently print through the vendor queue instead):
+Only if Step 1 was **Good**. Use the exact `printer name:` from Step 1.
+`--direct-only` makes sure it can never print through the vendor queue instead:
 
 ```powershell
-diag --test-print "PM2411BT (USB direct, serial PUT-YOURS-HERE)" | Tee-Object "$HOME\Desktop\ibp-test\2-print.txt"
+diag --test-print "PM2411BT (USB direct, serial PUT-YOURS-HERE)" --direct-only | Tee-Object "$HOME\Desktop\ibp-test\2-print.txt"
 ```
 
 **Good:** `outcome=completed`, `job_id=None`, history shows `printer started
 printing (DOING)` and `printer finished (DONE ...)`. The label says *IBP TEST
 PRINT*, upright, all four corner words and the border visible, not cut off.
-Anything else (`uncertain`, `timeout`, `error`, `FAILED: ...`): **do not run it
-again**. Note what came out of the printer and take a photo of the label.
+`FAILED: --direct-only: ...` means nothing was printed (record the message).
+Anything else (`uncertain`, `timeout`, `error`): **do not run it again**. Note
+what came out of the printer and take a photo of the label.
 
 ## Step 3: turn-off switch (no label)
 
 ```powershell
 $env:IBP_PRINTING_DIRECT="0"
+diag --direct-status | Tee-Object "$HOME\Desktop\ibp-test\3-off-status.txt"
 diag | Tee-Object "$HOME\Desktop\ibp-test\3-off.txt"
 Remove-Item Env:IBP_PRINTING_DIRECT
 ```
 
-**Good:** `direct USB printing: OFF (queue-only)` and no `[direct USB]` under
-*Verdict*. Do not print in this step.
+**Good:** the first says `direct USB printing: OFF (IBP_PRINTING_DIRECT=0)` and
+`no USB device was opened`; the second `direct USB printing: OFF (queue-only)`
+and no `[direct USB]` under *Verdict*. Do not print in this step.
 
 ## Step 4: shippy-gui (optional, no label)
 
@@ -121,9 +136,10 @@ Add photos of any printed label.
 |---|---|---|
 | 1. Direct open works with the vendor queue installed? | good / busy / no reply | If busy: which fix worked? |
 | 2a. Cover reply (`cover CLOSE/OPEN`) arrives? | yes / no | |
-| 2b. Pushed `DOING`/`DONE` seen after cover close? | yes / no | |
+| 2b. `--listen`: `SSSGETCAP:OPEN`/`CLOSE` pushed on cover open/close? | yes / no | |
+| 2c. `--listen`: `DOING`/`DONE` after cover close? | yes / no | |
 | 3. Direct test print `completed` and label correct? | yes / no / skipped | outcome: |
-| 4. `IBP_PRINTING_DIRECT=0` shows `OFF (queue-only)`? | yes / no | |
+| 4. `IBP_PRINTING_DIRECT=0` shows `OFF`, nothing opened? | yes / no | |
 | 5. shippy-gui lists the direct printer? | yes / no / skipped | |
 | 6. Logs zipped and sent? | email / USB | |
 | Vendor queue name / PC name | | |
