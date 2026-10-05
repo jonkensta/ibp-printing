@@ -12,6 +12,9 @@ The safety rules every path follows:
   the *move* on later ticks (and after a restart), never the print.
 * Availability first: if the state file cannot be written the watcher still
   prints, but logs CRITICAL and tells the volunteer once.
+* A label's metadata sidecar (``<label>.png.json``) is never printed; it moves
+  with its label, and the label journal (:mod:`ibp_printing.labels`) is told
+  where the label went (best effort: the journal never blocks printing).
 """
 
 import logging
@@ -47,6 +50,7 @@ from ibp_printing.watcher.detect import (
     wait_until_stable,
 )
 from ibp_printing.watcher.notify import Notifier
+from ibp_printing.watcher.sidecars import carry_sidecar
 from ibp_printing.watcher.state import (
     FILING,
     INTERRUPTED,
@@ -220,6 +224,9 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
         self._startup_files: dict[Path, Optional[tuple[int, int]]] = {}
         self._decided: dict[Path, tuple[int, int]] = {}
         self._notified: set[tuple[str, str]] = set()
+        # (recipient, tracking) of queued labels printed in this to-print pass;
+        # shown together in one box at the end of the pass.
+        self._printed_notices: list[tuple[str, str]] = []
         self._printers_available: Optional[bool] = None
         self._stats: dict[str, int] = {}
         self._stats_lock = threading.Lock()
@@ -435,12 +442,13 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
 
     # ---------------------------------------------------------- notifications
 
-    def _deliver(self, text: str, **context: Any) -> bool:
+    def _deliver(self, text: str, *, info: bool = False, **context: Any) -> bool:
         """Hand one message to the notifier. True once nothing more can be done.
 
         Returns True when the notifier accepted it, or when boxes are switched
         off or impossible here (it is logged instead); False when it was
-        refused and should be tried again later.
+        refused and should be tried again later. ``info`` is good news (an
+        information box instead of a warning).
         """
         if not self.config.notify_on_failure:
             log_event(
@@ -460,7 +468,7 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
                 **context,
             )
             return True
-        if self.notifier.notify(text):
+        if self.notifier.notify(text, info=info):
             log_event(logger, logging.INFO, "notifying volunteer", **context)
             return True
         log_event(
@@ -961,6 +969,7 @@ class WatcherCore:  # pylint: disable=too-many-instance-attributes,too-many-publ
                 file=path.name,
                 dest=str(dest),
             )
+            carry_sidecar(path, dest, subdir)
             return dest
         log_event(
             logger,

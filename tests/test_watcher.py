@@ -162,9 +162,10 @@ class RecordingNotifier(Notifier):
     def __init__(self) -> None:
         super().__init__(enabled=True, show=lambda text, title: None)
         self.texts: list[str] = []
+        self.infos: list[str] = []
 
-    def notify(self, text: str, title: str = "") -> bool:
-        self.texts.append(text)
+    def notify(self, text: str, title: str = "", *, info: bool = False) -> bool:
+        (self.infos if info else self.texts).append(text)
         return True
 
 

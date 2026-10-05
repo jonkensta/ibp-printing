@@ -25,6 +25,7 @@ from ibp_printing.paths import (
     CHECK_PRINTER_DIR,
     PRINTED_DIR,
     TO_PRINT_DIR,
+    is_sidecar,
 )
 from ibp_printing.watcher import messages
 from ibp_printing.watcher.core import (
@@ -588,6 +589,8 @@ class LabelWatcher(ToPrintQueue):
             return self._finish(FileOutcome("ignored", path, "not in watch folder"))
         if is_temp_name(path):
             return self._finish(FileOutcome("ignored", path, "temporary download"))
+        if is_sidecar(path):
+            return self._finish(FileOutcome("ignored", path, "metadata (*.json)"))
         if not path.is_file():
             return self._finish(FileOutcome("missing", path, "gone or not a file"))
 

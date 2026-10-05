@@ -1,4 +1,4 @@
-"""Non-blocking Windows message boxes to tell volunteers a label did not print."""
+"""Non-blocking Windows message boxes: a label did not print, or a queued one did."""
 
 import contextvars
 import logging
@@ -15,9 +15,13 @@ TITLE = "IBP Label Watcher"
 MB_OK = 0x00000000
 MB_ICONWARNING = 0x00000030
 MB_ICONERROR = 0x00000010
+MB_ICONINFORMATION = 0x00000040
 MB_SYSTEMMODAL = 0x00001000
 MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
 WARNING_FLAGS = MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL | MB_SETFOREGROUND
+# Good news ("the queued label printed"): on top, but not system-modal.
+INFO_FLAGS = MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
 
 
 def message_box(text: str, title: str = TITLE, flags: int = WARNING_FLAGS) -> int:
@@ -53,7 +57,8 @@ class Notifier:
 
     Messages that arrive while a box is open are queued and shown together in
     one combined box as soon as the open one is closed, so none is lost and
-    boxes never stack up.
+    boxes never stack up. A box made only of ``info`` messages gets the
+    information icon; anything else the warning icon.
     """
 
     def __init__(
@@ -66,7 +71,7 @@ class Notifier:
         self._show: Callable[[str, str], object] = show or message_box
         self._lock = threading.Lock()
         self._busy = False
-        self._pending: list[str] = []
+        self._pending: list[tuple[str, bool]] = []
         self._dropped = 0
 
     @property
@@ -80,8 +85,10 @@ class Notifier:
         with self._lock:
             return len(self._pending)
 
-    def notify(self, text: str, title: str = TITLE) -> bool:
+    def notify(self, text: str, title: str = TITLE, *, info: bool = False) -> bool:
         """Show a box without blocking the caller (or queue it behind the open one).
+
+        ``info`` marks good news (information icon, not system-modal).
 
         Returns:
             True if the message was accepted (shown now or queued to be shown
@@ -99,9 +106,9 @@ class Notifier:
             return False
         with self._lock:
             if self._busy:
-                self._pending.append(text)
+                self._pending.append((text, info))
                 if len(self._pending) > MAX_PENDING:
-                    lost = self._pending.pop(0)
+                    lost, _ = self._pending.pop(0)
                     self._dropped += 1
                     log_event(
                         logger,
@@ -122,17 +129,24 @@ class Notifier:
         context = contextvars.copy_context()
         threading.Thread(
             target=context.run,
-            args=(self._run, text, title),
+            args=(self._run, text, title, info),
             name="notify",
             daemon=True,
         ).start()
         return True
 
-    def _run(self, text: str, title: str) -> None:
+    def _display(self, text: str, title: str, info: bool) -> object:
+        if self._custom:
+            return self._show(text, title)
+        return message_box(text, title, INFO_FLAGS if info else WARNING_FLAGS)
+
+    def _run(self, text: str, title: str, info: bool) -> None:
         while True:
             try:
-                log_event(logger, logging.INFO, "message box shown", text=text)
-                result = self._show(text, title)
+                log_event(
+                    logger, logging.INFO, "message box shown", text=text, info=info
+                )
+                result = self._display(text, title, info)
                 log_event(logger, logging.INFO, "message box closed", result=result)
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 log_event(
@@ -146,7 +160,8 @@ class Notifier:
                 if not self._pending:
                     self._busy = False
                     return
-                text = combine(self._pending, self._dropped)
+                text = combine([queued for queued, _ in self._pending], self._dropped)
+                info = all(is_info for _, is_info in self._pending)
                 log_event(
                     logger,
                     logging.INFO,

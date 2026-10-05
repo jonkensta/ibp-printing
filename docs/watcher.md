@@ -51,7 +51,7 @@ All three are inside the watched folder (Downloads):
 | Folder | What is in it | What the watcher does |
 | --- | --- | --- |
 | `to-print\` | Labels that definitely did **not** reach any printer: saved by shippy/shippy-gui, or downloads the watcher itself could not print. | Retries them every `retry_seconds` while a usable printer exists. Leaves a file there while it keeps failing (one message box per file, not one per retry). |
-| `printed\` | Labels a printer accepted. | Nothing; a record. |
+| `printed\` | Labels a printer accepted (with their `.json` sidecars, if any). | Nothing; a record. |
 | `check-printer\` | Labels that were sent to a printer whose queue then reported a problem (error, timeout, deleted, tracking failed), or whose fate is unknown (including the watcher stopping mid-print), and other copies of such labels. | **Never** retries them: they may still come out once the printer is fixed. A message box asks the volunteer to check the printer and its queue first. To print one again, rename it so the name starts with `REPRINT` and move it into `to-print\` (see below). |
 
 A label is filed into the result folders next to the `to-print\` folder it came
@@ -82,6 +82,43 @@ after restarts; it never prints that file again.
 Files ending in `.partial` are labels still being written by an app; the
 watcher ignores them until they are renamed.
 
+### Who a queued label is for: sidecars and the label journal
+
+When shippy or shippy-gui saves a label into `to-print\` they also write a
+small JSON **sidecar** next to it, `<label>.png.json`, with the tracking code,
+shipment ID, recipient ("Jane Doe, Huntsville TX") and the app's name. The
+sidecar is written before the label appears, so the watcher always finds it.
+The watcher:
+
+- **never prints** a `*.json` file (in `to-print\` or Downloads) and never
+  shows a box about one;
+- **moves the sidecar with its label**, wherever the label goes: `printed\`,
+  `check-printer\`, `printed\duplicate_...`, `check-printer\duplicate_...`,
+  or (for a download that could not print) `to-print\`;
+- **updates the label journal** (`%LOCALAPPDATA%\ibp-printing\labels.jsonl`,
+  shared with the apps, see the README's *Duplicate-purchase protection*),
+  matched by the sidecar's tracking code: `printed` when it lands in
+  `printed\`, `check_printer` in `check-printer\`, `queued` while it waits in
+  `to-print\`. If the journal has no record of that label yet, one is created
+  from the sidecar. The apps use the journal to warn a volunteer who is about
+  to buy postage again for a shipment whose label is still waiting, may have
+  printed, or printed recently;
+- **tells the volunteer when a queued label prints**: after each pass through
+  `to-print\`, one information box (not a warning, not system-modal) lists
+  every label with a sidecar that printed in that pass, e.g. "Label for Jane
+  Doe, Huntsville TX (tracking 9400111899223197428490) printed." and reminds
+  them not to buy postage for it again. Several labels in one pass make one
+  box, not one each. Like the warning boxes, it is shown only when
+  `notify_on_failure` is on, and it waits behind (or is combined with) a box
+  that is already open.
+
+Labels without a sidecar (downloads, files dropped in by hand, older app
+versions) are printed and filed exactly as before; the journal is not
+touched. The journal never holds up printing: if it can't be read or written
+(locked for more than 5 s by another program, disk full, corrupt), that is
+logged at ERROR and the label is printed and filed anyway. A sidecar that
+can't be moved stays behind (logged), is never printed, and is harmless.
+
 ## What it does, step by step
 
 For a new file in **Downloads**:
@@ -90,7 +127,8 @@ For a new file in **Downloads**:
    folder (OneDrive, a D: drive) still works. It doesn't look inside
    subfolders (except `to-print\`, below).
 2. It ignores files that are still downloading: `.crdownload` (Chrome/Edge),
-   `.part` (Firefox), `.tmp`, `.partial`, and hidden files. It handles the
+   `.part` (Firefox), `.tmp`, `.partial`, and hidden files, and label
+   sidecars (`*.json`). It handles the
    final file when the browser renames it. A 0-byte file, or one with a
    `<name>.part`/`<name>.crdownload` sibling, is a browser placeholder: it is
    skipped at once (status `in_progress`) and handled when the real data
@@ -123,6 +161,8 @@ For a new file in **Downloads**:
    - sent, but the queue reported a problem, or the outcome is uncertain:
      `check-printer\`.
 
+   A label's `.json` sidecar moves with it, and the label journal records
+   where it went (see *Who a queued label is for*, above).
    If the file is locked it retries the move a few times. If it still can't be
    moved, it stays where it is, its reservation says where it belongs, and the
    move is retried on every retry tick and after restarts; it is never printed
@@ -139,7 +179,8 @@ is usable, it prints the files oldest first, with the same reading and
 reservation checks. It does not apply the shape check to to-print files, since
 they were put there on purpose, but logs a warning if one isn't 4x6-shaped. It
 stops the pass at the first printer failure, so a broken printer isn't fed the
-whole queue. A to-print file that stays locked or keeps changing is looked at
+whole queue. When the pass is over, one information box names every label
+with a sidecar that printed in it. A to-print file that stays locked or keeps changing is looked at
 again on the next few ticks, then reported once in a message box and left
 alone until it is renamed or changed.
 
@@ -472,7 +513,7 @@ Without pycups, the Linux backend uses `lpstat -p` and `lp`, so a fake printer i
 two small shell scripts early on `PATH`: `lpstat` printing
 `printer Fake_Label is idle.`, and `lp` copying its last argument somewhere
 (exit 1 to simulate a dead printer). Set `XDG_STATE_HOME` to a scratch folder
-to keep the test's state file apart. Note that the watcher also retries the
+to keep the test's state file and label journal apart. Note that the watcher also retries the
 apps' queue, `~/Downloads/to-print`, when you watch another folder.
 
 Run the tests with `uv run python -m unittest discover -s tests`.

@@ -186,3 +186,27 @@ def queued_unprintable(path: Path, reason: str) -> str:
         f"Problem: {reason}\n\n"
         "Remove it, or replace it with the PNG or PDF label."
     )
+
+
+def queued_printed(labels: list[tuple[str, str]]) -> str:
+    """Labels that waited in to-print printed (``(recipient, tracking)`` pairs).
+
+    One box for everything that printed in one pass through to-print.
+    """
+    lines = [
+        f"Label for {recipient or 'an unknown recipient'} "
+        f"(tracking {tracking or '?'}) printed."
+        for recipient, tracking in labels
+    ]
+    if len(lines) == 1:
+        return (
+            f"{lines[0]}\n\n"
+            "It had been waiting in the to-print folder. Do not buy postage for "
+            "this shipment again."
+        )
+    listing = "\n".join(f"- {line}" for line in lines)
+    return (
+        f"{len(lines)} shipping labels that were waiting in the to-print folder "
+        f"printed:\n\n{listing}\n\n"
+        "Do not buy postage for these shipments again."
+    )

@@ -2,9 +2,11 @@
 
 import logging
 from pathlib import Path
+from typing import Any, Optional
 
+from ibp_printing import labels
 from ibp_printing.log import attempt, get_logger, log_event
-from ibp_printing.paths import PARTIAL_SUFFIX
+from ibp_printing.paths import PARTIAL_SUFFIX, is_sidecar, read_sidecar
 from ibp_printing.watcher import messages
 from ibp_printing.watcher.core import (
     MAX_DEFERRED_RETRIES,
@@ -30,7 +32,32 @@ class ToPrintQueue(WatcherCore):
     watcher moves its own definite failures into the first. Every
     ``retry_seconds`` the worker checks the folders and, if discovery finds a
     usable printer, prints the files oldest first.
+
+    Metadata sidecars (``*.json``) are never printed; they move with their
+    label. When labels with metadata print, one information box per pass says
+    who they were for.
     """
+
+    def _flush_printed_notices(self) -> None:
+        """One information box for every queued label printed in this pass."""
+        printed, self._printed_notices = self._printed_notices, []
+        if printed:
+            self._deliver(
+                messages.queued_printed(printed),
+                info=True,
+                kind="queued_printed",
+                labels=[tracking for _, tracking in printed],
+            )
+
+    def _note_printed_from_queue(self, meta: Optional[dict[str, Any]]) -> None:
+        """Remember a queued label with metadata that printed (see above)."""
+        if meta and meta.get("tracking_code"):
+            self._printed_notices.append(
+                (
+                    str(meta.get("recipient_label") or ""),
+                    str(meta.get("tracking_code")),
+                )
+            )
 
     def queued_files(self) -> list[Path]:
         """Files waiting in the to-print folders, oldest first (half-written ones
@@ -46,6 +73,8 @@ class ToPrintQueue(WatcherCore):
         found.sort(key=lambda p: (file_signature(p) or (0, 0))[1])
         files = []
         for path in found:
+            if is_sidecar(path):
+                continue
             if path.name.endswith(PARTIAL_SUFFIX) or is_temp_name(path):
                 log_event(
                     logger,
@@ -65,8 +94,14 @@ class ToPrintQueue(WatcherCore):
 
         Runs on the worker thread (or the main thread for ``--once``). Stops at
         the first label that fails, so a broken printer is not fed the whole
-        queue.
+        queue. Labels with metadata that printed are announced in one box.
         """
+        try:
+            return self._retry_pass(reason)
+        finally:
+            self._flush_printed_notices()
+
+    def _retry_pass(self, reason: str) -> list[FileOutcome]:
         self._notified = {key for key in self._notified if Path(key[0]).exists()}
         # First, move labels that printed earlier but could not be filed.
         outcomes = self.reconcile_filing()
@@ -235,16 +270,26 @@ class ToPrintQueue(WatcherCore):
         if self.stop_event.is_set():
             return self._queued_outcome(FileOutcome("shutdown", path, "not printed"))
 
+        meta = read_sidecar(path)
         submission = self._submit(path, digest, loaded.image, job_name)
-        return self._file_queued(path, digest, submission)
+        return self._file_queued(path, digest, submission, meta)
 
     def _file_queued(
-        self, path: Path, digest: str, submission: Submission
+        self,
+        path: Path,
+        digest: str,
+        submission: Submission,
+        meta: Optional[dict[str, Any]] = None,
     ) -> FileOutcome:
         filed = self._file_common(path, digest, submission)
         if filed is not None:
+            if filed.status == "printed":
+                self._note_printed_from_queue(meta)
             level = logging.INFO if filed.status == "printed" else logging.ERROR
             return self._queued_outcome(filed, level)
+        if meta and meta.get("tracking_code"):
+            # Still waiting (a no-op when the journal already says so).
+            labels.update_status_from_meta(meta, labels.QUEUED, file=str(path))
         self._notify_once(
             path,
             "retry_failed",
