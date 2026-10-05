@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 """``ibp-print-diag``: explain which printers are usable and why, and test them.
 
 The default action runs a full discovery pass and prints a report showing
@@ -6,19 +7,26 @@ whether direct USB printing is on, every direct USB printer (path, serial,
 queue each detection gate and its result, every USB device that has a
 VID:PID, the final verdict, recent PrintService events, and where the logs
 live. ``--test-print`` sends a 4x6 test label (directly over USB when a
-supported printer is plugged in), ``--direct-status`` runs only the direct
-probe, and ``--no-direct`` turns the direct path off for this run.
+supported printer is plugged in; with ``--direct-only`` only directly, never
+through a print queue), ``--direct-status`` runs only the direct probe and
+names each direct printer as ``--test-print`` takes it, ``--listen SECONDS``
+shows every line the direct printer pushes (cover open/close, realign), and
+``--no-direct`` turns the direct path off for this run.
 """
 
 import argparse
+import contextlib
 import json
 import logging
+import signal
 import socket
 import sys
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from collections import Counter
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -29,10 +37,16 @@ from ibp_printing.api import (
     print_to_first_available,
 )
 from ibp_printing.backends import PrintError
+from ibp_printing.direct import tspl
 from ibp_printing.direct.backend import DirectFirstBackend
 from ibp_printing.direct.config import set_direct_enabled
 from ibp_printing.direct.session import StatusProbe
-from ibp_printing.direct.transport import DirectDevice
+from ibp_printing.direct.transport import DirectDevice, Transport, TransportError
+from ibp_printing.discovery import (
+    PM2411BT_VID_PID,
+    direct_candidates,
+    is_direct_name,
+)
 from ibp_printing.log import (
     configure_logging,
     default_log_dir,
@@ -63,6 +77,15 @@ LABEL_DPI = 300
 TEST_PRINT_TIMEOUT_S = 60.0
 NO_PRINTER_MESSAGE = "No label printer found plugged in."
 LOG_APP = "diag"
+# Exit status of ``--test-print --direct-only`` when nothing was printed
+# (no usable direct printer, direct printing off, or the direct print was
+# refused before sending). 1 stays "printed, but not confirmed".
+EXIT_DIRECT_NOT_SENT = 3
+# ``--listen``: longest single read, so Ctrl+C and the deadline are prompt.
+LISTEN_POLL_S = 0.5
+# ``--listen``: how long to wait for the reply to the closing SSSGETCAP.
+LISTEN_FINAL_S = 2.0
+PROBABLY_PM2411BT = "PM2411BT (probably)"
 
 
 # -- report ------------------------------------------------------------------
@@ -152,6 +175,8 @@ def _direct_device_data(
 ) -> dict[str, Any]:
     data = device.to_log()
     data["supported"] = is_supported_direct_model(device.model)
+    data["identified_as"] = identify_device(device)
+    data["open_problem"] = open_problem(device)
     data["probe"] = probe.to_log() if probe is not None else None
     return data
 
@@ -176,23 +201,75 @@ def direct_section(
     return lines
 
 
+def identify_device(device: DirectDevice) -> str:
+    """The device's model, or ``"PM2411BT (probably)"`` by VID:PID.
+
+    A device that could not be opened (busy in the Windows spooler, no
+    permission) has no 1284 ID, so no model; the PM2411BT's VID:PID still
+    identifies it.
+    """
+    if device.model:
+        return device.model
+    if device.vid_pid == PM2411BT_VID_PID:
+        return PROBABLY_PM2411BT
+    return "(unknown model)"
+
+
+def _busy_text(device: DirectDevice) -> str:
+    if device.kind == "usbprint":
+        return "BUSY: another program or the Windows print queue has it open"
+    return "BUSY: another program (e.g. CUPS) has it open"
+
+
+def open_problem(device: DirectDevice) -> str:
+    """Why discovery could not open the device ("" when it could, or unknown)."""
+    if device.busy:
+        return _busy_text(device)
+    if device.accessible is False:
+        if device.kind == "usblp":
+            return "NO PERMISSION: this user cannot open it"
+        return "CANNOT OPEN: see the error below"
+    if not device.present:
+        return "MISSING: the device node does not exist"
+    return ""
+
+
+def _supported_text(device: DirectDevice) -> str:
+    if is_supported_direct_model(device.model):
+        return "YES"
+    if not device.model and device.vid_pid == PM2411BT_VID_PID:
+        return (
+            f"probably (VID:PID {PM2411BT_VID_PID} is the PM2411BT's; its "
+            "1284 ID could not be read)"
+        )
+    return "NO"
+
+
 def describe_direct_devices(
     devices: Sequence[DirectDevice],
     probes: Mapping[str, StatusProbe],
     candidates: Optional[Mapping[str, PrinterCandidate]] = None,
 ) -> list[str]:
-    """One block per USB printer-class device, with its probe and verdict."""
+    """One block per USB printer-class device, with its probe and verdict.
+
+    ``candidates`` (by device path) adds each direct candidate's name, exactly
+    as ``--test-print`` takes it, and its verdict.
+    """
     if not devices:
         return ["  (no USB printer-class devices found)"]
     lines: list[str] = []
     for index, device in enumerate(devices, start=1):
-        supported = is_supported_direct_model(device.model)
+        title = identify_device(device)
+        problem = open_problem(device)
+        if problem:
+            lines += [f"  [{index}] {title} - {problem}", f"        at {device.path}"]
+        else:
+            lines.append(f"  [{index}] {title} at {device.path}")
         lines += [
-            f"  [{index}] {device.model or '(unknown model)'} at {device.path}",
             f"        kind={device.kind or '-'} vid_pid={device.vid_pid or '-'} "
             f"serial={device.serial or '-'} product={device.product or '-'}",
             f"        1284 ID: {device.ieee1284_raw or '(not read)'}",
-            f"        supported model: {'YES' if supported else 'NO'}  "
+            f"        supported model: {_supported_text(device)}  "
             f"present={device.present} accessible="
             f"{'-' if device.accessible is None else device.accessible} "
             f"busy={device.busy}",
@@ -209,6 +286,7 @@ def describe_direct_devices(
         if candidate is not None:
             for reason in candidate.reasons():
                 lines.append(f"        reason: {reason}")
+            lines.append(f"        printer name: {candidate.name}")
             lines.append(
                 f"        => usable as {candidate.name!r}: "
                 f"{'YES' if candidate.usable else 'NO'}"
@@ -401,12 +479,18 @@ def _font(size: int) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
-def run_test_print(printer_name: Optional[str]) -> tuple[Optional[PrintResult], str]:
+def run_test_print(
+    printer_name: Optional[str], *, direct_only: bool = False
+) -> tuple[Optional[PrintResult], str]:
     """Print a test label and return ``(result, error)``; error is "" on success.
 
     Args:
         printer_name: The queue to print to, or None/"" for the best usable one.
+        direct_only: Print only to a direct USB printer; never to a print
+            queue (see :func:`run_direct_test_print`).
     """
+    if direct_only:
+        return run_direct_test_print(printer_name)
     img = make_test_label(printer_name or "")
     try:
         if printer_name:
@@ -426,6 +510,79 @@ def run_test_print(printer_name: Optional[str]) -> tuple[Optional[PrintResult], 
         )
         return None, str(exc)
     return result, ""
+
+
+def run_direct_test_print(
+    printer_name: Optional[str],
+) -> tuple[Optional[PrintResult], str]:
+    """``--test-print --direct-only``: a direct USB print or nothing.
+
+    The label goes to the named direct printer (or the best usable one) over
+    USB only. When there is none, direct printing is off, or the print is
+    refused before sending (``PrintError``), the error says so and nothing is
+    sent anywhere: no Windows / CUPS queue is ever tried.
+    """
+    nothing = "nothing was printed and no print queue was tried"
+    layer = _direct_layer()
+    if layer is None:
+        return _direct_only_failed(
+            f"the active backend has no direct USB layer; {nothing}"
+        )
+    enabled, why = layer.direct_mode()
+    if not enabled:
+        return _direct_only_failed(f"direct USB printing is OFF ({why}); {nothing}")
+    if printer_name and not is_direct_name(printer_name):
+        return _direct_only_failed(
+            f"{printer_name!r} is not a direct USB printer name (it would print "
+            "through a print queue); use the 'printer name:' from --direct-status, "
+            f"e.g. 'PM2411BT (USB direct, serial ...)'; {nothing}"
+        )
+    try:
+        if printer_name:
+            img = make_test_label(printer_name)
+            result = layer.print_image(
+                img,
+                printer_name,
+                job_name="IBP Test Print",
+                track_timeout_s=TEST_PRINT_TIMEOUT_S,
+            )
+        else:
+            devices, _ = layer.list_devices()
+            usable = sorted(
+                (c for c in direct_candidates(devices) if c.usable),
+                key=PrinterCandidate.rank_key,
+            )
+            if not usable:
+                return _direct_only_failed(
+                    "no usable direct USB printer found (run --direct-status to "
+                    f"see why); {nothing}"
+                )
+            img = make_test_label(usable[0].name)
+            result = layer.print_to_candidate(
+                img,
+                usable[0],
+                job_name="IBP Test Print",
+                track_timeout_s=TEST_PRINT_TIMEOUT_S,
+            )
+    except PrintError as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "direct-only test print not sent",
+            error=describe_exception(exc),
+        )
+        reason = getattr(exc, "reason", "")
+        return _direct_only_failed(
+            f"direct USB print not sent{f' ({reason})' if reason else ''}: "
+            f"{str(exc).rstrip('.')}; {nothing}"
+        )
+    return result, ""
+
+
+def _direct_only_failed(message: str) -> tuple[None, str]:
+    text = f"--direct-only: {message}"
+    log_event(logger, logging.ERROR, "direct-only test print failed", error=text)
+    return None, text
 
 
 def describe_result(result: Optional[PrintResult], error: str) -> str:
@@ -488,10 +645,26 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="print a 4x6 test label to PRINTER (default: best usable printer)",
     )
     parser.add_argument(
+        "--direct-only",
+        action="store_true",
+        help="with --test-print: print only over direct USB; if no direct printer "
+        "is usable or it refuses, fail (exit status 3) instead of using a print "
+        "queue",
+    )
+    parser.add_argument(
         "--direct-status",
         action="store_true",
         help="only list direct USB printers and probe their cover/paper state "
         "(sends nothing that prints)",
+    )
+    parser.add_argument(
+        "--listen",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="open the direct USB printer and show every line it sends for "
+        "SECONDS (sends only SSSGETCAP, at the start and the end; no label); "
+        "open and close the cover meanwhile. Ctrl+C stops early",
     )
     parser.add_argument(
         "--no-direct",
@@ -501,7 +674,14 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="also echo the log to stderr"
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.direct_only and args.test_print is None:
+        parser.error("--direct-only only applies to --test-print")
+    if args.listen is not None and args.listen <= 0:
+        parser.error("--listen needs a number of seconds > 0")
+    if args.listen is not None and (args.direct_status or args.test_print is not None):
+        parser.error("--listen cannot be combined with --direct-status/--test-print")
+    return args
 
 
 def _direct_layer() -> Optional[DirectFirstBackend]:
@@ -524,31 +704,75 @@ def probe_direct_devices(
     }
 
 
-def run_direct_status(as_json: bool) -> int:
-    """``--direct-status``: list direct devices and probe them; exit code."""
-    layer = _direct_layer()
+def _candidates_by_path(
+    devices: Sequence[DirectDevice],
+) -> dict[str, PrinterCandidate]:
+    return {
+        candidate.direct_device.path: candidate
+        for candidate in direct_candidates(devices)
+        if candidate.direct_device is not None
+    }
+
+
+def _direct_off(
+    layer: Optional[DirectFirstBackend], as_json: bool, what: str
+) -> Optional[int]:
+    """Print why the direct layer cannot be used; None when it can."""
     if layer is None:
         message = "the active backend has no direct USB layer"
         print(json.dumps({"error": message}) if as_json else message)
         return 1
     enabled, why = layer.direct_mode()
+    if enabled:
+        return None
+    log_event(logger, logging.INFO, f"{what}: direct USB printing is off", why=why)
+    if as_json:
+        data = {"direct_enabled": False, "decided_by": why, "devices": []}
+        print(json.dumps(data, indent=2))
+    else:
+        print(
+            f"-- Direct USB printers --\n  direct USB printing: OFF ({why})\n"
+            f"  {what}: no USB device was opened (direct printing is turned off)"
+        )
+    return 1
+
+
+def run_direct_status(as_json: bool) -> int:
+    """``--direct-status``: list direct devices and probe them; exit code.
+
+    With direct printing off (``IBP_PRINTING_DIRECT=0`` / ``--no-direct``)
+    it says so and opens nothing.
+    """
+    layer = _direct_layer()
+    off = _direct_off(layer, as_json, "--direct-status")
+    if off is not None or layer is None:
+        return off or 1
+    enabled, why = layer.direct_mode()
     devices, errors = layer.list_devices()
     probes = probe_direct_devices(devices, layer)
+    candidates = _candidates_by_path(devices)
     ready = [path for path, probe in probes.items() if probe.ready]
+    device_data = []
+    for device in devices:
+        data = _direct_device_data(device, probes.get(device.path))
+        candidate = candidates.get(device.path)
+        data["printer_name"] = candidate.name if candidate else None
+        data["usable"] = candidate.usable if candidate else False
+        device_data.append(data)
     log_event(
         logger,
         logging.INFO,
         "direct status",
         enabled=enabled,
         decided_by=why,
-        devices=[_direct_device_data(d, probes.get(d.path)) for d in devices],
+        devices=device_data,
         errors=errors,
     )
     if as_json:
         data = {
             "direct_enabled": enabled,
             "decided_by": why,
-            "devices": [_direct_device_data(d, probes.get(d.path)) for d in devices],
+            "devices": device_data,
             "errors": errors,
             "ready": ready,
         }
@@ -558,11 +782,237 @@ def run_direct_status(as_json: bool) -> int:
             "-- Direct USB printers (status probe: SSSGETCAP / SSSGETPAPER only) --",
             f"  direct USB printing: {'ON' if enabled else 'OFF'} ({why})",
         ]
-        lines += describe_direct_devices(devices, probes)
+        lines += describe_direct_devices(devices, probes, candidates)
         lines += [f"  error: {error}" for error in errors]
         lines.append(f"  ready: {len(ready)} of {len(probes)} supported printer(s)")
         print("\n".join(lines))
     return 0 if probes and len(ready) == len(probes) else 1
+
+
+# -- listen ----------------------------------------------------------------------
+
+# The clock --listen uses (tests replace it).
+_now: Callable[[], float] = time.monotonic
+
+
+@contextlib.contextmanager
+def _ctrl_c_flag() -> Iterator[list[bool]]:
+    """Turn Ctrl+C into a flag (``flag[0]``) while listening.
+
+    A KeyboardInterrupt raised in the middle of a Windows overlapped read
+    could leave a request pending; with the flag the current read finishes
+    (at most ``LISTEN_POLL_S``) and the device is closed normally. Outside
+    the main thread the handler cannot be installed and Ctrl+C raises as
+    usual (still caught by :func:`run_listen`).
+    """
+    flag = [False]
+
+    def handler(_signum: int, _frame: Any) -> None:
+        flag[0] = True
+
+    try:
+        previous = signal.signal(signal.SIGINT, handler)
+    except ValueError:  # not the main thread
+        yield flag
+        return
+    try:
+        yield flag
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def describe_line(line: str) -> str:
+    """What one line from the printer means, for ``--listen``."""
+    event = tspl.parse_line(line)
+    if event.kind is tspl.EventKind.COVER:
+        return f"cover {event.value}"
+    if event.kind is tspl.EventKind.PRINTING:
+        meaning = {"DOING": "paper moving (realign or label)", "DONE": "finished"}
+        return f"printing {event.value}: {meaning.get(event.value, '?')}"
+    if event.kind is tspl.EventKind.PAPER:
+        return f"paper sensor {event.value} (unreliable)"
+    if event.kind is tspl.EventKind.COMMAND_ERROR:
+        return "printer rejected a line"
+    return "(not understood)"
+
+
+class _Listener:
+    """Reads (and logs) everything one open printer sends; see run_listen."""
+
+    def __init__(self, transport: Transport, *, write_s: float, echo: bool) -> None:
+        self.transport = transport
+        self.write_s = write_s
+        self.echo = echo
+        self.started = _now()
+        self.heard: list[dict[str, Any]] = []
+        self.notes: list[str] = []
+        self.failed = ""
+        self._line_dirty = False
+
+    def note(self, text: str, level: int = logging.INFO) -> None:
+        """Record (and print) one event of the listen."""
+        stamp = f"+{_now() - self.started:5.1f} s"
+        self.notes.append(f"{stamp}  {text}")
+        log_event(logger, level, "listen: " + text)
+        if self.echo:
+            print(f"  {stamp}  {text}", flush=True)
+
+    def ask_cover(self) -> None:
+        """Send SSSGETCAP once (the only thing --listen ever writes)."""
+        query = tspl.QUERY_COVER
+        if self._line_dirty:
+            query = tspl.CRLF + query  # end a fragment left by a short write
+        try:
+            accepted = self.transport.write_all(query, self.write_s)
+        except (TransportError, OSError) as exc:
+            self._line_dirty = True
+            self.note(f"SSSGETCAP not sent: {exc}", logging.WARNING)
+            return
+        self._line_dirty = 0 < accepted < len(query)
+        if accepted < len(query):
+            self.note(
+                f"SSSGETCAP: printer took {accepted}/{len(query)} bytes (busy?)",
+                logging.WARNING,
+            )
+        else:
+            self.note("sent SSSGETCAP")
+
+    def listen(self, seconds: float, stop: list[bool]) -> None:
+        """Read for ``seconds``, or until ``stop[0]`` or a read error."""
+        deadline = _now() + seconds
+        while not stop[0] and not self.failed:
+            remaining = deadline - _now()
+            if remaining <= 0:
+                return
+            try:
+                lines = self.transport.read_lines(min(LISTEN_POLL_S, remaining))
+            except (TransportError, OSError) as exc:
+                self.failed = f"reading from the printer failed: {exc}"
+                self.note(self.failed, logging.ERROR)
+                return
+            for line in lines:
+                at = round(_now() - self.started, 3)
+                self.heard.append(
+                    {"t_s": at, "line": line, "meaning": describe_line(line)}
+                )
+                self.note(f"{line!r:28} {describe_line(line)}")
+
+    def summary(self) -> str:
+        """Counts of the cover / printing lines heard."""
+        counts = Counter(
+            (event.kind.value, event.value)
+            for event in (tspl.parse_line(item["line"]) for item in self.heard)
+        )
+        parts = [f"{kind} {value} x{n}" for (kind, value), n in sorted(counts.items())]
+        return ", ".join(parts) or "nothing"
+
+
+def _open_listen_printer(
+    layer: DirectFirstBackend, as_json: bool
+) -> Optional[tuple[PrinterCandidate, Transport]]:
+    """Open the best usable direct printer for --listen; None (reported) if not."""
+    devices, errors = layer.list_devices()
+    candidates = _candidates_by_path(devices)
+    usable = sorted(
+        (c for c in candidates.values() if c.usable), key=PrinterCandidate.rank_key
+    )
+    if not usable:
+        lines = ["--listen: no usable direct USB printer to listen to"]
+        lines += describe_direct_devices(devices, {}, candidates)
+        lines += [f"  error: {error}" for error in errors]
+        log_event(logger, logging.ERROR, "\n".join(lines))
+        print(
+            json.dumps({"error": lines[0], "devices": len(devices)})
+            if as_json
+            else "\n".join(lines)
+        )
+        return None
+    candidate = usable[0]
+    device = candidate.direct_device
+    assert device is not None
+    try:
+        return candidate, layer.open_device(device)
+    except (TransportError, OSError) as exc:
+        reason = getattr(exc, "reason", "")
+        problem = _busy_text(device) if reason == "busy" else "CANNOT OPEN"
+        message = f"--listen: cannot open {candidate.name}: {problem} ({exc})"
+        log_event(logger, logging.ERROR, message)
+        print(json.dumps({"error": message}) if as_json else message)
+        return None
+
+
+def run_listen(seconds: float, as_json: bool) -> int:
+    """``--listen SECONDS``: show what the direct printer pushes; exit code.
+
+    Opens the best usable direct printer, sends ``SSSGETCAP`` (so the first
+    reply shows the link works), reads and prints every line for
+    ``seconds`` (cover pushes ``SSSGETCAP:OPEN`` / ``CLOSE``, the realign's
+    ``SSSGETPRINTING:DOING`` / ``DONE``), sends ``SSSGETCAP`` again and
+    releases the device. Nothing else is written, so no label moves except
+    the printer's own realign. Ctrl+C stops early and still releases the
+    device. Exit status 0 when at least one line was heard, 1 otherwise,
+    130 after Ctrl+C.
+    """
+    layer = _direct_layer()
+    off = _direct_off(layer, as_json, "--listen")
+    if off is not None or layer is None:
+        return off or 1
+    opened = _open_listen_printer(layer, as_json)
+    if opened is None:
+        return 1
+    candidate, transport = opened
+    if not as_json:
+        print(
+            f"-- Listening to {candidate.name} for {seconds:g} s --\n"
+            "  sends only SSSGETCAP (now and at the end); open and close the "
+            "cover now. Ctrl+C stops early.",
+            flush=True,
+        )
+    listener = _Listener(
+        transport, write_s=layer.timeouts.query_write_s, echo=not as_json
+    )
+    with transport, _ctrl_c_flag() as stop:
+        try:
+            listener.ask_cover()
+            listener.listen(seconds, stop)
+            if not stop[0] and not listener.failed:
+                listener.ask_cover()
+                listener.listen(max(LISTEN_FINAL_S, layer.timeouts.query_reply_s), stop)
+        except KeyboardInterrupt:
+            stop[0] = True
+        if stop[0]:
+            listener.note("stopped early (Ctrl+C)")
+    interrupted = stop[0]
+    log_event(
+        logger,
+        logging.INFO,
+        "listen finished",
+        printer=candidate.name,
+        seconds=seconds,
+        heard=listener.heard,
+        interrupted=interrupted,
+        failed=listener.failed,
+        device_released=transport.closed,
+    )
+    if as_json:
+        data = {
+            "printer": candidate.name,
+            "seconds": seconds,
+            "heard": listener.heard,
+            "notes": listener.notes,
+            "interrupted": interrupted,
+            "error": listener.failed or None,
+            "device_released": transport.closed,
+        }
+        print(json.dumps(data, indent=2))
+    else:
+        print(
+            f"-- Heard {len(listener.heard)} line(s): {listener.summary()}; "
+            "printer released --"
+        )
+    if interrupted:
+        return 130
+    return 0 if listener.heard and not listener.failed else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -573,6 +1023,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log_dir = configure_logging(args.log_dir, app=LOG_APP, console=args.verbose)
     if args.direct_status:
         return run_direct_status(args.json)
+    if args.listen is not None:
+        return run_listen(args.listen, args.json)
 
     discovery = discover()
     probes = (
@@ -592,8 +1044,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     test_result: Optional[PrintResult] = None
     test_error = ""
     if args.test_print is not None:
-        test_result, test_error = run_test_print(args.test_print or None)
+        test_result, test_error = run_test_print(
+            args.test_print or None, direct_only=args.direct_only
+        )
         exit_code = 0 if test_result is not None and test_result.outcome.ok else 1
+        if test_result is None and args.direct_only:
+            exit_code = EXIT_DIRECT_NOT_SENT
     elif not discovery.usable:
         exit_code = 1
 

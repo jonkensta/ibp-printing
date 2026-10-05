@@ -332,7 +332,9 @@ ibp-print-diag --events 240       # include PrintService events from the last 4 
 ibp-print-diag --test-print       # print a 4x6 test label to the best usable printer
 ibp-print-diag --test-print "DYMO LabelWriter 4XL 0922:0028"
 ibp-print-diag --test-print "PM2411BT (USB direct, serial Q529E56G9290059)"
-ibp-print-diag --direct-status    # only the direct USB printers: cover/paper probe
+ibp-print-diag --test-print --direct-only   # direct USB only: never a print queue (exit 3 if not sent)
+ibp-print-diag --direct-status    # only the direct USB printers: cover/paper probe, printer names
+ibp-print-diag --listen 30        # show every line the direct printer sends for 30 s (no label)
 ibp-print-diag --no-direct        # this run without direct USB (like IBP_PRINTING_DIRECT=0)
 ibp-print-diag --log-dir C:\temp\logs -v   # custom log dir, echo log to the console
 ```
@@ -342,7 +344,23 @@ and for every USB printer-class device its path, serial, 1284 ID, whether it
 is a supported model, present, accessible and not busy, and for a supported
 model a **status probe** (cover open/closed, paper sensor) - the probe only
 sends the two status queries, so it never feeds or prints a label. Unsupported
-devices are listed but never probed.
+devices are listed but never probed. Each direct printer's `printer name:` is
+exactly what `--test-print` takes. A device that cannot be opened (no 1284 ID)
+but has the PM2411BT's VID:PID `2E3C:5760` is shown as `PM2411BT (probably)`
+with the reason, e.g. `BUSY: another program or the Windows print queue has
+it open`. With direct printing off (`IBP_PRINTING_DIRECT=0`, `--no-direct`),
+`--direct-status` and `--listen` say so and open no device.
+
+`--test-print --direct-only` prints only over direct USB: if no direct printer
+is usable, direct printing is off, the name is not a direct printer's, or the
+printer refuses before anything is sent (busy, cover open, no answer), it
+fails with exit status 3 and never falls back to a Windows / CUPS queue.
+
+`--listen SECONDS` opens the direct printer, sends `SSSGETCAP` (at the start
+and at the end, nothing else) and prints every line the printer pushes, with
+timestamps: open and close the cover to see `SSSGETCAP:OPEN` / `CLOSE` and the
+realign's `SSSGETPRINTING:DOING` / `DONE`. Ctrl+C stops early and releases the
+device cleanly.
 
 For every queue the report shows its name, port, driver, decoded status and
 attribute bits, each detection gate (name ends in VID:PID / USB device
@@ -350,7 +368,8 @@ present) with its result, and the matching USB devices with their status and
 error code. It then lists all USB devices that have a VID:PID, the verdict
 (usable printers in the order they will be tried), recent PrintService events,
 and the log directory. The report is also written to the log. The command exits
-with status 1 if no printer is usable or the test print failed.
+with status 1 if no printer is usable or the test print failed (3 for a
+`--direct-only` test print that sent nothing).
 
 The test label is 1200x1800 px (4x6 in at 300 DPI) with a border, corner
 labels, and a half-inch ruler grid, so you can see scaling, cropping, or

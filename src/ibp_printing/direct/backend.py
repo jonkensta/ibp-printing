@@ -198,6 +198,14 @@ class DirectFirstBackend(PrinterBackend):
         with transport:
             return probe_status(transport, timeouts=self.timeouts)
 
+    def open_device(self, device: DirectDevice) -> Transport:
+        """Open ``device`` with this backend's transport factory (diagnostics).
+
+        Raises:
+            TransportError / OSError: when it cannot be opened.
+        """
+        return self._opener(device)
+
     def get_default_printer(self) -> Optional[str]:
         return self.inner.get_default_printer()
 

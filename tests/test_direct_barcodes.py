@@ -16,6 +16,12 @@ The study behind the choice of nearest-neighbour at 100 % (see
 100 % decoded 449/512, LANCZOS+0xAF at 95 % (the old rule) 299/512; every
 method lost decodes at 95 %. ``test_nearest_beats_filtered_resampling``
 keeps a small version of that comparison.
+
+Plain nearest-neighbour dropped thin features (a 1 px border on a 300 dpi
+label printed nothing on hardware), so ``tspl.scale_dark_mask`` adds a
+thin-feature rescue; these tests check that it leaves bars exactly as
+nearest-neighbour draws them, also with 1 px rules boxed tight around the
+barcode (``thin_rules``).
 """
 
 import unittest
@@ -64,9 +70,17 @@ def runs(bits: str) -> list[int]:
 
 
 def draw_label(
-    size: tuple[int, int], bits: str, module_px: int, phase: int = 0
+    size: tuple[int, int],
+    bits: str,
+    module_px: int,
+    phase: int = 0,
+    thin_rules: bool = False,
 ) -> tuple[Image.Image, tuple[int, int, int]]:
-    """A white label with one barcode; returns it and ``(x0, y0, height)``."""
+    """A white label with one barcode; returns it and ``(x0, y0, height)``.
+
+    ``thin_rules`` adds EasyPost-style 1 px rules: an inner border and boxes
+    tight around the barcode (8 px clear of the bars).
+    """
     width, height = size
     img = Image.new("L", size, 255)
     draw = ImageDraw.Draw(img)
@@ -84,6 +98,9 @@ def draw_label(
         if bit == "1":
             draw.rectangle([x, y0, x + module_px - 1, y0 + bar_h - 1], fill=0)
         x += module_px
+    if thin_rules:
+        draw.rectangle([10 + phase, 10 + phase, width - 11, height - 11], outline=0)
+        draw.rectangle([5, y0 - 8 - phase, width - 6, y0 + bar_h + 7], outline=0)
     return img, (x0, y0, bar_h)
 
 
@@ -135,6 +152,15 @@ def decodes(img: Image.Image, want: str) -> bool:
     assert pyzbar is not None
     found = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.CODE128])
     return any(result.data.decode("latin-1").endswith(want) for result in found)
+
+
+def nearest_rasterize(img: Image.Image) -> bytes:
+    """The previous rule: plain nearest-neighbour at 100 %, then the threshold."""
+    img = img.convert("L")
+    left, top, new_w, new_h = tspl.label_rect(img.size)
+    canvas = Image.new("L", (812, 1218), 255)
+    canvas.paste(img.resize((new_w, new_h), Image.Resampling.NEAREST), (left, top))
+    return tspl.pack_raster(canvas)
 
 
 def old_rasterize(img: Image.Image) -> bytes:
@@ -192,6 +218,32 @@ class BarWidthTests(unittest.TestCase):
         self.check_widths((1624, 2436), "code128", TRACKING, 4, exact=True)
         self.check_widths((1218, 1827), "gs1_128", IMPB, 3, exact=True)
 
+    def test_bars_are_plain_nearest_with_thin_rules_around(self):
+        # Bars are wider than a dot's footprint, so the thin-feature rescue
+        # leaves them to nearest-neighbour; only the 1 px rules differ.
+        for src_size, kind, data, module_px in (
+            ((1200, 1800), "code128", TRACKING, 3),
+            ((1200, 1800), "gs1_128", IMPB, 4),
+            ((1624, 2436), "code128", TRACKING, 4),
+            ((1000, 1500), "gs1_128", IMPB, 3),
+        ):
+            for phase in range(4):
+                with self.subTest(size=src_size, kind=kind, phase=phase):
+                    label, where = draw_label(
+                        src_size, modules(kind, data), module_px, phase
+                    )
+                    self.assertEqual(tspl.rasterize(label), nearest_rasterize(label))
+                    label, where = draw_label(
+                        src_size, modules(kind, data), module_px, phase, True
+                    )
+                    # Inside the band, clear of the 1 px border at the sides.
+                    new = band(raster_image(tspl.rasterize(label)), src_size, where)
+                    old = band(raster_image(nearest_rasterize(label)), src_size, where)
+                    inner = (20, 0, new.width - 20, new.height)
+                    self.assertEqual(
+                        new.crop(inner).tobytes(), old.crop(inner).tobytes()
+                    )
+
     def test_300_dpi_easypost_label_widths_within_one_dot(self):
         self.check_widths((1200, 1800), "code128", TRACKING, 3, exact=False)
         self.check_widths((1200, 1800), "gs1_128", IMPB, 4, exact=False)
@@ -218,13 +270,16 @@ class ZbarDecodeTests(unittest.TestCase):
         phases=range(4),
         gains=(-1, 0, 1, 2),
         failures: Optional[list[str]] = None,
+        thin_rules: bool = False,
     ) -> tuple[int, int]:
         """``(decoded, tried)`` over cases x phases x gains."""
         good = tried = 0
         for src_size, kind, data, module_px in cases:
             bits = modules(kind, data)
             for phase in phases:
-                label, where = draw_label(src_size, bits, module_px, phase)
+                label, where = draw_label(
+                    src_size, bits, module_px, phase, thin_rules=thin_rules
+                )
                 crop = band(raster_image(rasterize(label)), src_size, where)
                 for gain in gains:
                     tried += 1
@@ -246,6 +301,21 @@ class ZbarDecodeTests(unittest.TestCase):
         failures: list[str] = []
         good, tried = self.rate(tspl.rasterize, failures=failures)
         self.assertEqual(good, tried, failures)
+
+    def test_every_case_decodes_with_thin_rules_around(self):
+        failures: list[str] = []
+        good, tried = self.rate(tspl.rasterize, failures=failures, thin_rules=True)
+        self.assertEqual(good, tried, failures)
+
+    def test_no_regression_against_plain_nearest(self):
+        # The thin-feature rescue never touches bars: same decodes, and with
+        # 1 px rules around the barcode at least as many as plain nearest.
+        for thin_rules in (False, True):
+            with self.subTest(thin_rules=thin_rules):
+                new, tried = self.rate(tspl.rasterize, thin_rules=thin_rules)
+                old, _ = self.rate(nearest_rasterize, thin_rules=thin_rules)
+                self.assertGreaterEqual(new, old)
+                self.assertEqual(new, tried)
 
     def test_nearest_beats_filtered_resampling(self):
         cases = tuple(case for case in self.CASES if case[0] == (1200, 1800))

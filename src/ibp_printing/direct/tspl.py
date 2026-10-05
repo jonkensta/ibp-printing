@@ -14,12 +14,13 @@ length as a little-endian uint32, terminated by a zero length.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from ibp_printing.direct import lzo
 from ibp_printing.render import flatten_for_print, orient_portrait
@@ -54,6 +55,8 @@ QUERY_PAPER = b"SSSGETPAPER\r\n"
 
 # Grey value -> 1 if dark. Used with Image.point to threshold in C.
 _DARK_LUT = [255 if value <= DARK_THRESHOLD else 0 for value in range(256)]
+# Grey value -> 0 (dark) or 255 (white): the threshold as an "L" mask.
+_DARK_MASK_LUT = [0 if value <= DARK_THRESHOLD else 255 for value in range(256)]
 
 
 def label_rect(size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -81,26 +84,92 @@ def place_on_label(img: Image.Image) -> Image.Image:
 
     Landscape images are rotated to portrait (never cropped). An image that is
     already 812x1218 (a 4x6 label at 203 dpi) is used dot for dot. Anything
-    else is scaled to *fill* the label (100 %, not the GDI path's 95 %) with
-    nearest-neighbour resampling and centered.
+    else is thresholded (dark if grey <= 0xAF) and scaled to *fill* the label
+    (100 %, not the GDI path's 95 %, centered) by :func:`scale_dark_mask`:
+    nearest-neighbour, plus every dark feature too thin for nearest-neighbour
+    to be sure to hit gets at least one dot.
 
-    Why not LANCZOS/BOX at 95 % like the GDI path: the barcode study in
-    ``tests/test_direct_barcodes.py`` (Code 128 and USPS IMpb GS1-128 on
-    1200x1800 300 dpi labels, decoded with zbar after simulated dot gain)
-    found that nearest at 100 % keeps every bar's edges on whole dots in a
-    consistent way, while filtered resampling plus a threshold, or any 95 %
-    shrink, turns 3-pixel modules into 1-3 dot bars and loses decodes. The
-    full 812x1218 raster printed on hardware with every edge inside the label,
-    so the GDI path's 5 % backoff (for unknown driver margins) is not needed.
+    Why nearest and not LANCZOS/BOX at 95 % like the GDI path: the barcode
+    study in ``tests/test_direct_barcodes.py`` (Code 128 and USPS IMpb
+    GS1-128 on 1200x1800 300 dpi labels, decoded with zbar after simulated dot
+    gain) found that nearest at 100 % keeps every bar's edges on whole dots in
+    a consistent way, while filtered resampling plus a threshold, area
+    coverage, min-pooling, or any 95 % shrink turns 3-pixel modules into 1-3
+    dot bars and loses decodes. Plain nearest, however, skips source pixels:
+    a 1-pixel rule on a 300 dpi label vanished on hardware. The thin-feature
+    rescue fixes that without touching barcode bars (see
+    ``docs/printers/pm2411bt.md``, *Image placement*). The full 812x1218
+    raster printed on hardware with every edge inside the label, so the GDI
+    path's 5 % backoff (for unknown driver margins) is not needed.
     """
     img = flatten_for_print(orient_portrait(img)).convert("L")
     if img.size == (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS):
         return img
     left, top, new_w, new_h = label_rect(img.size)
-    img = img.resize((new_w, new_h), Image.Resampling.NEAREST)
+    scaled = scale_dark_mask(img.point(_DARK_MASK_LUT), (new_w, new_h))
     canvas = Image.new("L", (LABEL_WIDTH_DOTS, LABEL_HEIGHT_DOTS), 255)
-    canvas.paste(img, (left, top))
+    canvas.paste(scaled, (left, top))
     return canvas
+
+
+def scale_dark_mask(mask: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Scale a 0 (dark) / 255 (white) "L" mask to ``size`` keeping thin features.
+
+    Nearest-neighbour samples the source pixel under each dot's centre, so a
+    feature at least one dot footprint (``scale`` source pixels) wide is
+    always hit and keeps its edges on whole dots - which is what barcodes
+    need. Narrower features (with ``k = ceil(scale)``: whatever a k x k
+    opening removes, e.g. 1-pixel rules at 300 dpi) can fall between the
+    samples; each of their pixels also darkens the dot whose footprint holds
+    the pixel's centre (instead of being sampled), a partition of the source,
+    so every dark feature keeps at least one dot and a 1-pixel rule prints
+    exactly one dot thick. Images whose features are all at least ``k``
+    pixels wide (barcode bars, text strokes) scale exactly as with
+    nearest-neighbour.
+    """
+    scale = max(mask.width / size[0], mask.height / size[1])
+    k = math.ceil(scale - 1e-9)
+    if k < 2:  # upscaling or 1:1: nearest-neighbour misses nothing
+        return mask.resize(size, Image.Resampling.NEAREST)
+    thick, thin = _split_thin(mask, k)
+    scaled = thick.resize(size, Image.Resampling.NEAREST)
+    if thin.getextrema()[0] == 255:  # no thin features
+        return scaled
+    # Pillow's BOX filter averages the pixels whose centres fall in each dot's
+    # footprint (a partition of the source), so "any dark pixel" is "< 255".
+    # Done per axis so a lone dark pixel never rounds back up to 255.
+    any_dark = [0 if value < 255 else 255 for value in range(256)]
+    rescued = thin.resize((size[0], thin.height), Image.Resampling.BOX)
+    rescued = rescued.point(any_dark).resize(size, Image.Resampling.BOX)
+    return ImageChops.darker(scaled, rescued.point(any_dark))
+
+
+def _split_thin(mask: Image.Image, k: int) -> tuple[Image.Image, Image.Image]:
+    """Split ``mask`` into ``(thick, thin)`` masks: its k x k opening, and the rest.
+
+    ``thick`` is the union of the all-dark k x k blocks; ``thin`` holds the
+    dark pixels outside every such block (features narrower than k pixels).
+    """
+    padded = Image.new("L", (mask.width + 2 * k, mask.height + 2 * k), 255)
+    padded.paste(mask, (k, k))  # white margin: offset() wraps around
+    # Erode dark: dark only where the k x k block starting here is all dark.
+    eroded = padded
+    for shift in range(1, k):
+        eroded = ImageChops.lighter(eroded, ImageChops.offset(padded, -shift, 0))
+    rows = eroded
+    for shift in range(1, k):
+        eroded = ImageChops.lighter(eroded, ImageChops.offset(rows, 0, -shift))
+    # Dilate back with the reflected block: the union of all-dark k x k blocks.
+    opened = eroded
+    for shift in range(1, k):
+        opened = ImageChops.darker(opened, ImageChops.offset(eroded, shift, 0))
+    rows = opened
+    for shift in range(1, k):
+        opened = ImageChops.darker(opened, ImageChops.offset(rows, 0, shift))
+    # Dark in the mask but not in the opening.
+    thin = ImageChops.lighter(padded, ImageChops.invert(opened))
+    box = (k, k, k + mask.width, k + mask.height)
+    return opened.crop(box), thin.crop(box)
 
 
 def pack_raster(img: Image.Image) -> bytes:
