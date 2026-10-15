@@ -21,7 +21,7 @@ from ibp_printing.labels import (
     record_purchase,
     update_status,
 )
-from ibp_printing.log import configure_logging, default_log_dir, log_file_names
+from ibp_printing.log import configure_logging, default_log_dir, log_file_names, quiet
 from ibp_printing.paths import downloads_dir, save_for_retry, to_print_dir
 from ibp_printing.models import (
     Discovery,
@@ -56,6 +56,7 @@ __all__ = [
     "pending_labels",
     "print_image",
     "print_to_first_available",
+    "quiet",
     "recipient_key",
     "record_purchase",
     "save_for_retry",

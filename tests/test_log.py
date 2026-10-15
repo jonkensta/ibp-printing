@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +26,7 @@ from ibp_printing.log import (
     get_logger,
     log_event,
     log_file_names,
+    quiet,
 )
 
 
@@ -428,3 +430,30 @@ class DescribeExceptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuietTests(CaptureMixin):
+    """quiet() drops routine records but never errors."""
+
+    formatter = HumanFormatter()
+
+    def test_quiet_drops_below_error(self):
+        with quiet():
+            log_event(self.logger, logging.INFO, "poll info")
+            log_event(self.logger, logging.WARNING, "poll warning")
+            log_event(self.logger, logging.ERROR, "poll error")
+        log_event(self.logger, logging.INFO, "after")
+        text = "\n".join(self.lines())
+        self.assertNotIn("poll info", text)
+        self.assertNotIn("poll warning", text)
+        self.assertIn("poll error", text)
+        self.assertIn("after", text)
+
+    def test_quiet_is_per_thread(self):
+        with quiet():
+            worker = threading.Thread(
+                target=log_event, args=(self.logger, logging.INFO, "other thread")
+            )
+            worker.start()
+            worker.join()
+        self.assertIn("other thread", "\n".join(self.lines()))

@@ -36,6 +36,10 @@ _APP_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _ATTEMPT_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "ibp_printing_attempt_id", default=None
 )
+# Set by quiet(): routine records are dropped, errors still get through.
+_QUIET: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ibp_printing_quiet", default=False
+)
 _CONFIGURED_DIRS: set[tuple[Path, str]] = set()
 _CONFIGURE_LOCK = threading.Lock()
 
@@ -53,7 +57,26 @@ def log_event(logger: logging.Logger, level: int, message: str, /, **data: Any) 
     The first three parameters are positional-only, so ``data`` may itself
     contain keys named ``logger``, ``level`` or ``message``.
     """
+    if level < logging.ERROR and _QUIET.get():
+        return
     logger.log(level, message, extra={"data": data}, stacklevel=2)
+
+
+@contextlib.contextmanager
+def quiet() -> Iterator[None]:
+    """Drop this package's records below ERROR logged inside the block.
+
+    For status polls (an app re-running ``discover()`` every few seconds):
+    every pass would otherwise log the whole discovery, burying the history
+    of real print attempts as the log rotates. The caller should log changes
+    itself (printer appeared / disappeared). The flag is per thread and per
+    context, so a print running elsewhere is still logged in full.
+    """
+    token = _QUIET.set(True)
+    try:
+        yield
+    finally:
+        _QUIET.reset(token)
 
 
 def current_attempt_id() -> Optional[str]:
