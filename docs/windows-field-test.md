@@ -1,5 +1,8 @@
 # Windows field test: direct USB printing (PM2411BT)
 
+> **Status: finished (2026-11).** PM2411BT direct USB printing field-tested OK
+> on the shipping laptops; released in v0.2.0. Kept for reference.
+
 > Tests ibp-printing commit `2406c4a` (`2406c4ae84f32ed2901e0758c1ec5779cc1e4ce8`, branch `feat/direct-usb`).
 > Every command below is pinned to it, so the code cannot change under you.
 
