@@ -162,6 +162,14 @@ class LinuxMediaPrintTests(unittest.TestCase):
         self.assertEqual(png.tobytes(), img.rotate(90, expand=True).tobytes())
         self.assertNotIn("fit-to-page", self.lp_args)
 
+    def test_backend_request_label_keeps_its_aspect_ratio(self):
+        # ibp-backend's 85x32 mm label PNG on a 1.4x3.5 in label roll.
+        png = self.printed(
+            Image.new("L", (1004, 378), 0), "custom_35.56x88.9mm_35.56x88.9mm"
+        )
+        self.assertEqual(png.size, (420, 1050))
+        self.assertEqual(png.point(lambda v: 255 - v).getbbox(), (12, 0, 407, 1050))
+
     def test_unknown_media_falls_back_to_a_letter_page(self):
         png = self.printed(Image.new("L", (1050, 420), 255), None)
         self.assertEqual(png.size, (2550, 3300))
