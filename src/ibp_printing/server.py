@@ -392,7 +392,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         "--log-dir",
         type=Path,
         default=None,
-        help="where to write printer-print-server.log/.jsonl",
+        help="log directory (default: ~/.local/state/ibp-printing/logs)",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
