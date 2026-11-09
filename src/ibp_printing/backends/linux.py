@@ -9,6 +9,7 @@ VID:PID is plugged in. Plugged-in devices are read from sysfs
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -26,7 +27,12 @@ from ibp_printing.models import (
     PrintResult,
     UsbDevice,
 )
-from ibp_printing.render import PRINT_SCALE_FACTOR, flatten_for_print, orient_portrait
+from ibp_printing.render import (
+    PRINT_SCALE_FACTOR,
+    fill_page,
+    flatten_for_print,
+    orient_portrait,
+)
 
 logger = get_logger(__name__)
 
@@ -36,6 +42,42 @@ POINTS_PER_INCH = 72
 PAGE_WIDTH_POINTS = 612
 PAGE_HEIGHT_POINTS = 792
 PAGE_MARGIN_POINTS = 18
+
+_POINTS_PER_UNIT = {"in": 72.0, "mm": 72 / 25.4, "cm": 72 / 2.54, "pt": 1.0}
+_NUMBER = r"(\d+(?:\.\d+)?)"
+# PWG self-describing media names end in "_<w>x<h><unit>":
+# "na_letter_8.5x11in", "custom_35.56x88.9mm_35.56x88.9mm".
+_PWG_SIZE = re.compile(rf"_{_NUMBER}x{_NUMBER}(in|mm)$")
+# PPD PageSize choices: "w288h432" (points), "Custom.4x6in", "Custom.1.4x3.5in".
+_PPD_POINTS = re.compile(rf"w{_NUMBER}h{_NUMBER}$")
+_PPD_CUSTOM = re.compile(rf"Custom\.{_NUMBER}x{_NUMBER}(in|mm|cm|pt)?$")
+
+
+def media_size_points(name: str) -> Optional[tuple[float, float]]:
+    """``(width, height)`` in points of a PWG media name or PPD PageSize choice.
+
+    Returns None for names that do not carry their size (``Letter``, ``A4``,
+    ``Custom.WIDTHxHEIGHT``).
+    """
+    name = name.strip()
+    match = _PWG_SIZE.search(name) or _PPD_CUSTOM.match(name)
+    if match:
+        factor = _POINTS_PER_UNIT[match.group(3) or "pt"]
+        return float(match.group(1)) * factor, float(match.group(2)) * factor
+    match = _PPD_POINTS.match(name)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    return None
+
+
+def page_pixels(
+    size_points: tuple[float, float], dpi: int = DEFAULT_PRINT_DPI
+) -> tuple[int, int]:
+    """A page size in points as whole pixels at ``dpi``."""
+    return (
+        round(size_points[0] * dpi / POINTS_PER_INCH),
+        round(size_points[1] * dpi / POINTS_PER_INCH),
+    )
 
 
 def list_usb_devices(sys_root: Union[str, Path] = "/sys") -> list[UsbDevice]:
@@ -155,26 +197,44 @@ class LinuxPrinterBackend(PrinterBackend):
         job_name: str,
         track_timeout_s: float = 0.0,
     ) -> PrintResult:
-        """Print with ``lp`` after scaling onto a letter-size canvas."""
+        """Print with ``lp`` after fitting the image to the queue's default media.
+
+        The image is turned to the media's orientation and scaled (aspect
+        kept) to fill a page of the queue's default media size at 300 DPI, so
+        a landscape label on a portrait label roll is rotated, and a label
+        image already the media's size is printed pixel for pixel. If the
+        media size cannot be found, it is scaled onto a letter page and sent
+        with ``-o fit-to-page`` instead.
+        """
         result = PrintResult(printer_name=printer_name, job_name=job_name)
-        img = self._scale_onto_page(flatten_for_print(orient_portrait(img)))
+        media = self.default_media(printer_name)
+        size = media_size_points(media) if media else None
+        # A page-sized 300 DPI image prints at its natural size (as the old
+        # ibp-print-server sent it); only the letter fallback needs scaling.
+        options: list[str] = []
+        if size is not None:
+            page = page_pixels(size)
+            img = fill_page(flatten_for_print(img), page)
+            log_event(
+                logger, logging.INFO, "fitting to media", media=media, page_px=page
+            )
+        else:
+            img = self._scale_onto_page(flatten_for_print(orient_portrait(img)))
+            options = ["-o", "fit-to-page"]
+            log_event(
+                logger,
+                logging.WARNING,
+                "default media size unknown; scaling onto a letter page",
+                media=media,
+            )
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
             path = tmpfile.name
         try:
-            img.save(path)
+            img.save(path, dpi=(DEFAULT_PRINT_DPI, DEFAULT_PRINT_DPI))
             with timed_step(logger, "lp", printer=printer_name):
                 proc = subprocess.run(
-                    [
-                        "lp",
-                        "-d",
-                        printer_name,
-                        "-t",
-                        job_name,
-                        "-o",
-                        "fit-to-page",
-                        path,
-                    ],
+                    ["lp", "-d", printer_name, "-t", job_name, *options, path],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -203,6 +263,51 @@ class LinuxPrinterBackend(PrinterBackend):
         finally:
             self._remove_temp_file(path)
         return result
+
+    @staticmethod
+    def default_media(printer_name: str) -> Optional[str]:
+        """The queue's default media, as CUPS names it, or None.
+
+        With pycups: the IPP ``media-default`` (``"custom_35.56x88.9mm_..."``),
+        which CUPS derives from the PPD's default PageSize, custom sizes
+        included. Without it: the default ``PageSize`` choice from
+        ``lpoptions -l`` (``"w288h432"``), which shows a custom default only as
+        ``"Custom.WIDTHxHEIGHT"`` (no size), so label printers with a custom
+        default PageSize need pycups (the ``linux`` extra). Never raises.
+        """
+        try:
+            import cups  # type: ignore[import-not-found] # pylint: disable=import-outside-toplevel,import-error
+
+            attrs = cups.Connection().getPrinterAttributes(  # pylint: disable=c-extension-no-member
+                printer_name, requested_attributes=["media-default"]
+            )
+            media = attrs.get("media-default")
+            if media:
+                return str(media)
+        except ImportError:
+            pass
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.debug("CUPS media-default lookup failed", exc_info=True)
+
+        try:
+            proc = subprocess.run(
+                ["lpoptions", "-p", printer_name, "-l"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("lpoptions -l failed", exc_info=True)
+            return None
+        for line in proc.stdout.splitlines():
+            key, _, choices = line.partition(":")
+            if key.split("/")[0].strip() != "PageSize":
+                continue
+            for choice in choices.split():
+                if choice.startswith("*"):
+                    return choice[1:]
+        return None
 
     @staticmethod
     def _remove_temp_file(path: str) -> None:

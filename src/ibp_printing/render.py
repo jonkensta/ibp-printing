@@ -15,6 +15,36 @@ def orient_portrait(img: Image.Image) -> Image.Image:
     return img
 
 
+def fill_page(img: Image.Image, page_size: tuple[int, int]) -> Image.Image:
+    """Turn ``img`` to the page's orientation and scale it to fill the page.
+
+    A landscape image on a portrait page (or the reverse) is rotated 90
+    degrees counter-clockwise (as :func:`orient_portrait` does). The aspect
+    ratio is kept: the image is scaled to the largest size that fits and
+    centered on a white page of ``page_size`` pixels. An image that is
+    already the page size is returned unscaled, pixel for pixel.
+    """
+    page_w, page_h = page_size
+    if page_w <= 0 or page_h <= 0:
+        raise ValueError(f"page has no area: {page_size}")
+    if img.size[0] <= 0 or img.size[1] <= 0:
+        raise ValueError(f"image has no area: {img.size}")
+    if (img.size[0] > img.size[1] and page_w < page_h) or (
+        img.size[0] < img.size[1] and page_w > page_h
+    ):
+        img = img.rotate(90, expand=True)
+    if img.size == (page_w, page_h):
+        return img
+    scale = min(page_w / img.size[0], page_h / img.size[1])
+    scaled = img.resize(
+        (max(1, round(img.size[0] * scale)), max(1, round(img.size[1] * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    page = Image.new(scaled.mode, (page_w, page_h), "white")
+    page.paste(scaled, ((page_w - scaled.size[0]) // 2, (page_h - scaled.size[1]) // 2))
+    return page
+
+
 def flatten_for_print(img: Image.Image) -> Image.Image:
     """Convert to a mode GDI DIBs accept, compositing transparency onto white."""
     if img.mode in ("1", "L", "RGB"):

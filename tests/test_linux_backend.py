@@ -77,6 +77,97 @@ class LinuxPrintImageTests(unittest.TestCase):
         self.assertEqual(result.outcome, JobOutcome.UNCERTAIN)
 
 
+class MediaSizeTests(unittest.TestCase):
+    """media_size_points / page_pixels / default_media."""
+
+    def test_media_names(self):
+        cases = {
+            "custom_35.56x88.9mm_35.56x88.9mm": (35.56, 88.9, "mm"),
+            "na_letter_8.5x11in": (8.5, 11, "in"),
+            "oe_4x6-label_4x6in": (4, 6, "in"),
+            "Custom.1.4x3.5in": (1.4, 3.5, "in"),
+            "Custom.80x210mm": (80, 210, "mm"),
+            "w288h432": (288, 432, "pt"),
+        }
+        per_unit = {"in": 72.0, "mm": 72 / 25.4, "pt": 1.0}
+        for name, (width, height, unit) in cases.items():
+            with self.subTest(name=name):
+                got = linux.media_size_points(name)
+                assert got is not None
+                self.assertAlmostEqual(got[0], width * per_unit[unit])
+                self.assertAlmostEqual(got[1], height * per_unit[unit])
+
+    def test_names_without_a_size(self):
+        for name in ("Letter", "A4", "Custom.WIDTHxHEIGHT", ""):
+            with self.subTest(name=name):
+                self.assertIsNone(linux.media_size_points(name))
+
+    def test_intake_label_pixels(self):
+        size = linux.media_size_points("custom_35.56x88.9mm_35.56x88.9mm")
+        assert size is not None
+        self.assertEqual(linux.page_pixels(size), (420, 1050))
+
+    def test_default_media_from_lpoptions(self):
+        stdout = (
+            "PageSize/Media Size: w76h50 *w288h432 Custom.WIDTHxHEIGHT\n"
+            "Resolution/Resolution: *203dpi\n"
+        )
+        with mock.patch.object(
+            linux.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=stdout),
+        ):
+            self.assertEqual(linux.LinuxPrinterBackend.default_media("X"), "w288h432")
+
+    def test_default_media_lpoptions_failure_is_none(self):
+        with mock.patch.object(linux.subprocess, "run", side_effect=OSError("no")):
+            self.assertIsNone(linux.LinuxPrinterBackend.default_media("X"))
+
+
+class LinuxMediaPrintTests(unittest.TestCase):
+    """What print_image hands to ``lp`` for a given default media."""
+
+    def setUp(self):
+        quiet_logging(self)
+        self.backend = linux.LinuxPrinterBackend()
+
+    def printed(self, img: Image.Image, media):
+        """Print ``img`` with ``media`` as the default; return the PNG lp got."""
+        sent: list[Image.Image] = []
+        self.lp_args: list[str] = []
+
+        def run(args, **_kwargs):
+            self.lp_args = list(args)
+            with Image.open(args[-1]) as png:
+                png.load()
+                sent.append(png)
+            return completed(0)
+
+        with (
+            mock.patch.object(
+                linux.LinuxPrinterBackend, "default_media", return_value=media
+            ),
+            mock.patch.object(linux.subprocess, "run", side_effect=run),
+        ):
+            self.backend.print_image(img, "Label_0a5f:0001", job_name="Label")
+        self.assertEqual(len(sent), 1)
+        return sent[0]
+
+    def test_landscape_label_fills_portrait_label_media(self):
+        img = Image.new("L", (1050, 420), 255)
+        img.putpixel((0, 0), 0)
+        png = self.printed(img, "custom_35.56x88.9mm_35.56x88.9mm")
+        self.assertEqual(png.size, (420, 1050))
+        self.assertEqual(round(png.info["dpi"][0]), 300)
+        self.assertEqual(png.tobytes(), img.rotate(90, expand=True).tobytes())
+        self.assertNotIn("fit-to-page", self.lp_args)
+
+    def test_unknown_media_falls_back_to_a_letter_page(self):
+        png = self.printed(Image.new("L", (1050, 420), 255), None)
+        self.assertEqual(png.size, (2550, 3300))
+        self.assertIn("fit-to-page", self.lp_args)
+
+
 def fake_sysfs(root: Path, devices: dict[str, tuple[str, str, str]]) -> None:
     """Write ``<root>/bus/usb/devices/<name>/{idVendor,idProduct,product}``."""
     base = root / "bus" / "usb" / "devices"
