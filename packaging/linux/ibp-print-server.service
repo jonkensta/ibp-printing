@@ -1,0 +1,26 @@
+# ibp-print-server on an intake station: prints the IBP frontend's request
+# labels on the station's USB label printer (http://localhost:40121).
+#
+# Install (see docs/print-server.md):
+#   sudo install -m 0644 ibp-print-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ibp-print-server
+#
+# Every start or restart first upgrades ibp-printing from GitHub; the "-"
+# keeps the server starting on the installed version when that fails
+# (no network).
+[Unit]
+Description=IBP label print server
+After=cups.service network-online.target
+Wants=cups.service network-online.target
+
+[Service]
+Type=simple
+User=ibp
+ExecStartPre=-/home/ibp/.local/bin/uv tool upgrade ibp-printing
+ExecStart=/home/ibp/.local/bin/ibp-print-server server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
