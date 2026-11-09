@@ -1,7 +1,9 @@
-"""LinuxPrinterBackend.print_image with ``lp`` and the filesystem faked."""
+"""LinuxPrinterBackend with ``lp``, CUPS and sysfs faked."""
 
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from PIL import Image
@@ -73,6 +75,71 @@ class LinuxPrintImageTests(unittest.TestCase):
         ):
             result = self.print()
         self.assertEqual(result.outcome, JobOutcome.UNCERTAIN)
+
+
+def fake_sysfs(root: Path, devices: dict[str, tuple[str, str, str]]) -> None:
+    """Write ``<root>/bus/usb/devices/<name>/{idVendor,idProduct,product}``."""
+    base = root / "bus" / "usb" / "devices"
+    base.mkdir(parents=True)
+    for name, (vid, pid, product) in devices.items():
+        entry = base / name
+        entry.mkdir()
+        (entry / "idVendor").write_text(vid + "\n")
+        (entry / "idProduct").write_text(pid + "\n")
+        (entry / "product").write_text(product + "\n")
+    # An interface entry: no idVendor, never a device.
+    (base / "1-1:1.0").mkdir()
+
+
+class LinuxDiscoveryTests(unittest.TestCase):
+    """CUPS queues are matched to sysfs USB devices by their VID:PID suffix."""
+
+    def setUp(self):
+        quiet_logging(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sys_root = Path(tmp.name)
+        self.backend = linux.LinuxPrinterBackend(sys_root=self.sys_root)
+
+    def discover(self, queues: list[str]):
+        """Discover with ``queues`` as the CUPS printers."""
+        with (
+            mock.patch.object(
+                linux.LinuxPrinterBackend,
+                "_cups_printers",
+                return_value={name: {} for name in queues},
+            ),
+            mock.patch.object(
+                linux.LinuxPrinterBackend, "get_default_printer", return_value=None
+            ),
+        ):
+            return self.backend.discover()
+
+    def test_lists_usb_devices_from_sysfs(self):
+        fake_sysfs(self.sys_root, {"1-1": ("0a5f", "0001", "SP310")})
+        devices = linux.list_usb_devices(self.sys_root)
+        self.assertEqual(
+            [(d.vid_pid, d.name, d.connected) for d in devices],
+            [("0A5F:0001", "SP310", True)],
+        )
+
+    def test_no_sysfs_means_no_devices(self):
+        self.assertEqual(linux.list_usb_devices(self.sys_root / "missing"), [])
+
+    def test_queue_with_plugged_in_vid_pid_is_usable(self):
+        fake_sysfs(self.sys_root, {"1-1": ("0a5f", "0001", "SP310")})
+        discovery = self.discover(
+            ["iDPRT_SP310_0a5f:0001", "Office_Laser", "Dymo_0922:0028"]
+        )
+        self.assertEqual(
+            [candidate.name for candidate in discovery.usable],
+            ["iDPRT_SP310_0a5f:0001"],
+        )
+        self.assertEqual(len(discovery.usb_devices), 1)
+
+    def test_nothing_plugged_in_means_nothing_usable(self):
+        fake_sysfs(self.sys_root, {})
+        self.assertEqual(self.discover(["iDPRT_SP310_0a5f:0001"]).usable, [])
 
 
 if __name__ == "__main__":

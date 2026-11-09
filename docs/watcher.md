@@ -511,8 +511,9 @@ python -c "import ibp_printing; from pathlib import Path; from PIL import Image;
 
 Without pycups, the Linux backend uses `lpstat -p` and `lp`, so a fake printer is
 two small shell scripts early on `PATH`: `lpstat` printing
-`printer Fake_Label is idle.`, and `lp` copying its last argument somewhere
-(exit 1 to simulate a dead printer). Set `XDG_STATE_HOME` to a scratch folder
+`printer Fake_Label_VVVV:PPPP is idle.`, and `lp` copying its last argument somewhere
+(exit 1 to simulate a dead printer). Use the `VVVV:PPPP` of any USB device
+that is plugged in (`lsusb`): a queue is only usable while its device is. Set `XDG_STATE_HOME` to a scratch folder
 to keep the test's state file and label journal apart. Note that the watcher also retries the
 apps' queue, `~/Downloads/to-print`, when you watch another folder.
 

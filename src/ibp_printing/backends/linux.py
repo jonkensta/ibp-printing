@@ -1,21 +1,30 @@
-"""Linux printer backend using CUPS (pycups with an lpstat/lp fallback)."""
+"""Linux printer backend using CUPS (pycups with an lpstat/lp fallback).
+
+Queues follow the same naming rule as on Windows: a queue is a label printer
+only if its name ends in the printer's USB ``VID:PID`` (e.g.
+``iDPRT_SP310_0a5f:0001``), and it is usable while a USB device with that
+VID:PID is plugged in. Plugged-in devices are read from sysfs
+(``/sys/bus/usb/devices/*/idVendor``), so no udev library is needed.
+"""
 
 import logging
 import os
 import subprocess
 import tempfile
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Union
 
 from PIL import Image
 
 from ibp_printing.backends.base import PrinterBackend, PrintError
+from ibp_printing.discovery import discovery_from
 from ibp_printing.log import describe_exception, get_logger, log_event, timed_step
 from ibp_printing.models import (
     Discovery,
     JobOutcome,
-    PrinterCandidate,
     PrintQueue,
     PrintResult,
+    UsbDevice,
 )
 from ibp_printing.render import PRINT_SCALE_FACTOR, flatten_for_print, orient_portrait
 
@@ -29,13 +38,51 @@ PAGE_HEIGHT_POINTS = 792
 PAGE_MARGIN_POINTS = 18
 
 
+def list_usb_devices(sys_root: Union[str, Path] = "/sys") -> list[UsbDevice]:
+    """Plugged-in USB devices from ``<sys_root>/bus/usb/devices``.
+
+    Only device entries have ``idVendor`` / ``idProduct`` (interfaces such as
+    ``1-1:1.0`` do not), and sysfs lists only devices that are connected now.
+    """
+    devices: list[UsbDevice] = []
+    root = Path(sys_root) / "bus" / "usb" / "devices"
+    if not root.is_dir():
+        return devices
+
+    def read(path: Path) -> str:
+        try:
+            return path.read_text(encoding="latin-1").strip()
+        except OSError:
+            return ""
+
+    for entry in sorted(root.iterdir()):
+        vid, pid = read(entry / "idVendor"), read(entry / "idProduct")
+        if not (vid and pid):
+            continue
+        name = f"{read(entry / 'manufacturer')} {read(entry / 'product')}".strip()
+        devices.append(
+            UsbDevice(
+                device_id=f"usb:{entry.name}",
+                name=name,
+                status="OK",
+                pnp_class="USB",
+                vid_pid=f"{vid}:{pid}".upper(),
+                present=True,
+            )
+        )
+    return devices
+
+
 class LinuxPrinterBackend(PrinterBackend):
-    """CUPS backend. Every queue is usable; there is no USB VID:PID matching."""
+    """CUPS backend: queues named ``... VID:PID`` matched to USB devices."""
 
     platform_name = "linux"
 
+    def __init__(self, sys_root: Union[str, Path] = "/sys") -> None:
+        self.sys_root = sys_root
+
     def discover(self) -> Discovery:
-        """List CUPS queues."""
+        """List CUPS queues and pair them with plugged-in USB devices."""
         errors: list[str] = []
         queues: list[PrintQueue] = []
         default = self.get_default_printer()
@@ -58,19 +105,21 @@ class LinuxPrinterBackend(PrinterBackend):
             errors.append(f"queue enumeration failed: {exc!r}")
             logger.exception("CUPS queue enumeration failed")
 
-        discovery = Discovery(
-            queues=queues,
-            candidates=[
-                PrinterCandidate(queue, None, (), usb_matching=False)
-                for queue in queues
-            ],
-            errors=errors,
-        )
+        usb_devices: list[UsbDevice] = []
+        try:
+            usb_devices = list_usb_devices(self.sys_root)
+        except OSError as exc:
+            errors.append(f"USB device enumeration failed: {exc!r}")
+            logger.exception("USB device enumeration failed")
+
+        discovery = discovery_from(queues, usb_devices, errors)
         log_event(
             logger,
             logging.INFO,
             "discovery",
             queues=[queue.name for queue in queues],
+            usb=[f"{device.vid_pid} {device.name}" for device in usb_devices],
+            usable=[candidate.name for candidate in discovery.usable],
             errors=errors,
         )
         return discovery

@@ -166,6 +166,21 @@ time when a print server is unreachable.
    the *General* tab, and append ` 0922:0028` to the name.
 3. Run `ibp-print-diag` and check that the printer shows `=> usable: YES`.
 
+### Setting it up on Linux
+
+The same rule applies to CUPS queues; the plugged-in USB devices are read from
+sysfs (`/sys/bus/usb/devices`). CUPS queue names cannot contain spaces, so use
+`_` or `-`:
+
+```sh
+lsusb                                   # e.g. "ID 0a5f:0001 Zebra ..."
+sudo lpadmin -p iDPRT_SP310_0a5f:0001 -E -v usb://... -P label.ppd
+ibp-print-diag                          # the queue should show "=> usable: YES"
+```
+
+A queue whose name has no `VID:PID` suffix (an office printer, say) is listed
+by `ibp-print-diag` but never printed to.
+
 ## Public API
 
 Everything is importable from `ibp_printing`:
