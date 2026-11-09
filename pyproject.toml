@@ -25,6 +25,7 @@ watcher = [
 [project.scripts]
 ibp-print-diag = "ibp_printing.diagnostics:main"
 ibp-label-watcher = "ibp_printing.watcher.__main__:main"
+ibp-print-server = "ibp_printing.server:main"
 
 [project.gui-scripts]
 ibp-label-watcherw = "ibp_printing.watcher.__main__:main"
