@@ -237,6 +237,8 @@ With `track_timeout_s > 0` the Windows backend polls the spooler for the job
 (found by the unique `[attempt-id]` at the end of its document name) and
 records each status change in `result.history`. A successful `EndDoc` only
 means the spooler accepted the job. Tracking shows whether it actually printed.
+On Linux the CUPS job (its id from `lp`) is followed the same way, with pycups
+or, without it, `lpstat` (see [docs/print-server.md](docs/print-server.md#logs)).
 
 A **direct USB** job is always followed, whatever `track_timeout_s` is: the
 printer itself reports when it starts and finishes, so the outcome is never

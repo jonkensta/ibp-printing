@@ -14,7 +14,7 @@ from PIL import Image
 
 from ibp_printing.backends.base import PrinterBackend, PrintError
 from ibp_printing.discovery import discovery_from, vid_pid_from_device_id
-from ibp_printing.jobs import track_job
+from ibp_printing.jobs import track_job, tracking_failed
 from ibp_printing.log import (
     describe_exception,
     exception_summary,
@@ -293,17 +293,7 @@ class WindowsPrinterBackend(PrinterBackend):
                     timeout_s=track_timeout_s,
                 )
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            result.outcome = JobOutcome.TRACKING_FAILED
-            result.history.append(f"tracking failed: {exception_summary(exc)}")
-            log_event(
-                logger,
-                logging.WARNING,
-                "job tracking failed; the job was spooled but its outcome is unknown",
-                printer=printer_name,
-                job_id=result.job_id,
-                history=result.history,
-                error=describe_exception(exc),
-            )
+            tracking_failed(result, exc)
         if result.outcome == JobOutcome.VANISHED_UNSEEN:
             # Usually printed before the first poll, but log what the queue
             # holds in case the job was renamed or went somewhere unexpected.

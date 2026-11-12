@@ -18,7 +18,9 @@ from typing import Any, Optional, Union
 from PIL import Image
 
 from ibp_printing.backends.base import PrinterBackend, PrintError
+from ibp_printing.backends.cups_jobs import CupsJobPoller, job_id_from_lp
 from ibp_printing.discovery import discovery_from
+from ibp_printing.jobs import track_job, tracking_failed
 from ibp_printing.log import describe_exception, get_logger, log_event, timed_step
 from ibp_printing.models import (
     Discovery,
@@ -115,6 +117,15 @@ def list_usb_devices(sys_root: Union[str, Path] = "/sys") -> list[UsbDevice]:
     return devices
 
 
+def _cups_connection() -> Any:
+    """A ``cups.Connection``, or None without pycups (``lpstat`` is used then)."""
+    try:
+        import cups  # type: ignore[import-not-found] # pylint: disable=import-outside-toplevel,import-error
+    except ImportError:
+        return None
+    return cups.Connection()  # pylint: disable=c-extension-no-member
+
+
 class LinuxPrinterBackend(PrinterBackend):
     """CUPS backend: queues named ``... VID:PID`` matched to USB devices."""
 
@@ -205,6 +216,12 @@ class LinuxPrinterBackend(PrinterBackend):
         image already the media's size is printed pixel for pixel. If the
         media size cannot be found, it is scaled onto a letter page and sent
         with ``-o fit-to-page`` instead.
+
+        With ``track_timeout_s > 0`` the CUPS job (its id from lp's "request
+        id is QUEUE-N") is followed until it completes, is canceled or
+        aborted, sits in an error state, or the time is up; see
+        :mod:`ibp_printing.backends.cups_jobs`. Only an ``lp`` that failed
+        raises PrintError.
         """
         result = PrintResult(printer_name=printer_name, job_name=job_name)
         media = self.default_media(printer_name)
@@ -228,6 +245,7 @@ class LinuxPrinterBackend(PrinterBackend):
                 media=media,
             )
 
+        submitted: Optional[str] = None  # lp's stdout once the job is queued
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
             path = tmpfile.name
         try:
@@ -250,6 +268,7 @@ class LinuxPrinterBackend(PrinterBackend):
             )
             if proc.returncode != 0:
                 raise PrintError(f"Print command failed: {proc.stderr.strip()}")
+            submitted = proc.stdout
         except subprocess.TimeoutExpired as exc:
             # lp may have queued the job before hanging: not a definite failure.
             result.outcome = JobOutcome.UNCERTAIN
@@ -262,7 +281,38 @@ class LinuxPrinterBackend(PrinterBackend):
             raise PrintError(f"Print command failed: {exc}") from exc
         finally:
             self._remove_temp_file(path)
+        if submitted is not None:
+            result.job_id = job_id_from_lp(submitted)
+            if track_timeout_s > 0:
+                self._track(result, track_timeout_s)
         return result
+
+    @staticmethod
+    def _track(result: PrintResult, track_timeout_s: float) -> None:
+        """Follow the CUPS job; a tracking error becomes TRACKING_FAILED.
+
+        The job was submitted, so nothing here raises PrintError: whatever
+        happens, the caller gets the result and never sends the label again.
+        """
+        if result.job_id is None:
+            result.history.append("lp did not report a job id; not tracked")
+            log_event(
+                logger,
+                logging.WARNING,
+                "no CUPS job id in lp's output; the job is not tracked",
+                printer=result.printer_name,
+            )
+            return
+        try:
+            poll = CupsJobPoller(
+                result.printer_name,
+                result.job_id,
+                result.job_name,
+                connection=_cups_connection(),
+            )
+            track_job(result, poll, timeout_s=track_timeout_s)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            tracking_failed(result, exc)
 
     @staticmethod
     def default_media(printer_name: str) -> Optional[str]:

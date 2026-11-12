@@ -22,10 +22,11 @@ printer discovery, CUPS printing and logs as everything else here.
 
 Every response has `Access-Control-Allow-Origin: *`. The query string is
 ignored. "Queued" means accepted, not printed: one worker thread prints the
-labels one at a time, in the order they came in. A label that fails to print
-is logged and not retried. On `SIGINT` / `SIGTERM` the server stops taking
-requests, lets the label being printed finish (up to 60 s), and logs how many
-queued labels it dropped.
+labels one at a time, in the order they came in, and follows each CUPS job
+for up to 60 s (see "Logs" below). A label that fails or may not have printed
+is logged at ERROR and never retried or sent to a second printer. On
+`SIGINT` / `SIGTERM` the server stops taking requests, lets the label being
+printed finish (up to 90 s), and logs how many queued labels it dropped.
 
 The old server's form-encoded `POST /` (`data=<label JSON>`, rendered into a
 Code128 label by the server) is gone: the backend renders the label
@@ -132,5 +133,21 @@ journalctl -u ibp-print-server -f
 ```
 
 Each label is one attempt (`BEGIN print-server job` ... `END`) with the
-printer chosen, the media and page size used (`fitting to media`), and the
-`lp` result. `/health` polls are not logged unless they fail.
+printer chosen, the media and page size used (`fitting to media`), the `lp`
+result with its CUPS job id, each job state change (`job status changed`),
+and the outcome: `label printed (completed)`, or an ERROR
+`label may not have printed (<outcome>); check the printer` with the job's
+history. `/health` polls are not logged unless they fail.
+
+| CUPS says | Outcome |
+|---|---|
+| job completed | `completed` |
+| job canceled | `deleted` |
+| job aborted | `error` |
+| job stopped, or the queue stopped (CUPS disables a queue when the printer fails) for 10 s | `error` (the job may still print once the queue is resumed) |
+| still pending or printing after 60 s | `timeout` |
+| the job could not be followed | `tracking_failed` |
+
+Without pycups the job is followed with `lpstat`, which cannot tell a
+completed job from a canceled or aborted one: a job that leaves the queue
+counts as `completed`. A stopped queue is still reported as `error`.

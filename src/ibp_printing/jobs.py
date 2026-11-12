@@ -8,7 +8,12 @@ import logging
 import time
 from typing import Callable, Optional
 
-from ibp_printing.log import get_logger, log_event
+from ibp_printing.log import (
+    describe_exception,
+    exception_summary,
+    get_logger,
+    log_event,
+)
 from ibp_printing.models import JobOutcome, JobSnapshot, PrintResult
 from ibp_printing.winconst import (
     JOB_STATUS_BITS,
@@ -84,6 +89,21 @@ def track_job(
         waited_s=round(clock() - started, 2),
     )
     return outcome
+
+
+def tracking_failed(result: PrintResult, exc: BaseException) -> None:
+    """Record that following a submitted job raised: ``TRACKING_FAILED``."""
+    result.outcome = JobOutcome.TRACKING_FAILED
+    result.history.append(f"tracking failed: {exception_summary(exc)}")
+    log_event(
+        logger,
+        logging.WARNING,
+        "job tracking failed; the job was spooled but its outcome is unknown",
+        printer=result.printer_name,
+        job_id=result.job_id,
+        history=result.history,
+        error=describe_exception(exc),
+    )
 
 
 def outcome_when_gone(last_status: Optional[int]) -> JobOutcome:

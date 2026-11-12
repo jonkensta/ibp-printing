@@ -16,7 +16,7 @@ from printing_helpers import FakeBackend, PrintError, dymo, quiet_logging
 
 import ibp_printing
 from ibp_printing import PrintQueue, server
-from ibp_printing.models import PrintResult
+from ibp_printing.models import JobOutcome, PrintResult
 
 LABEL = "iDPRT_SP310_0a5f:0001"
 OFFICE = "Office_Laser"
@@ -174,6 +174,18 @@ class PrintImageTests(ServerTestCase):
         self.assertEqual(backend.sizes, [(1050, 420)])
         self.assertEqual(backend.printed[0][0], LABEL)
         self.assertTrue(backend.printed[0][1].startswith(server.JOB_NAME + " ["))
+
+    def test_jobs_are_tracked_and_failed_outcomes_logged(self):
+        backend = self.label_printer(outcomes={LABEL: JobOutcome.ERROR})
+        self.start(backend)
+        with self.assertLogs("ibp_printing.server", level="ERROR") as logs:
+            self.assertEqual(self.post(png())[0], 200)
+            backend.wait_for(1)
+            deadline = time.monotonic() + 5
+            while not logs.output and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(backend.printed[0][2], server.TRACK_TIMEOUT_S)
+        self.assertIn("label may not have printed (error)", logs.output[0])
 
     def test_query_string_is_ignored(self):
         backend = self.label_printer()
