@@ -14,9 +14,9 @@ place that:
   "printing / done" reports (see [Direct USB printing](#direct-usb-printing-pm2411bt));
 - **discovers** other label printers by matching each print queue to a
   plugged-in USB device by VID:PID;
-- **prints** a PIL image through the Windows spooler and GDI (CUPS on Linux),
-  falling back to the next printer only if one *definitely* never received the
-  job;
+- **prints** a PIL image through the Windows spooler and GDI (CUPS on Linux,
+  fitted to the queue's default media size), falling back to the next printer
+  only if one *definitely* never received the job;
 - **tracks** the spooled job until it prints, errors, is deleted, or times out;
 - **logs everything** (queues, USB devices, every GDI step, job status changes,
   PrintService events) to a human-readable log and a JSON-lines log, so a
@@ -36,7 +36,7 @@ On Windows this pulls in `pywin32` and `WMI` automatically. Optional extras:
 | Extra     | Adds                       | For                                      |
 |-----------|----------------------------|------------------------------------------|
 | `watcher` | `watchdog`, `pypdfium2`    | the [label watcher](#label-watcher)      |
-| `linux`   | `pycups`                   | richer CUPS queue info on Linux          |
+| `linux`   | `pycups`                   | CUPS queue details and default media size on Linux (needed for label printers with a custom page size, e.g. the [print server](#print-server)) |
 
 ```sh
 uv add "ibp-printing[watcher] @ git+https://github.com/jonkensta/ibp-printing@v0.1.0"
@@ -166,6 +166,21 @@ time when a print server is unreachable.
    the *General* tab, and append ` 0922:0028` to the name.
 3. Run `ibp-print-diag` and check that the printer shows `=> usable: YES`.
 
+### Setting it up on Linux
+
+The same rule applies to CUPS queues; the plugged-in USB devices are read from
+sysfs (`/sys/bus/usb/devices`). CUPS queue names cannot contain spaces, so use
+`_` or `-`:
+
+```sh
+lsusb                                   # e.g. "ID 0a5f:0001 Zebra ..."
+sudo lpadmin -p iDPRT_SP310_0a5f:0001 -E -v usb://... -P label.ppd
+ibp-print-diag                          # the queue should show "=> usable: YES"
+```
+
+A queue whose name has no `VID:PID` suffix (an office printer, say) is listed
+by `ibp-print-diag` but never printed to.
+
 ## Public API
 
 Everything is importable from `ibp_printing`:
@@ -222,6 +237,8 @@ With `track_timeout_s > 0` the Windows backend polls the spooler for the job
 (found by the unique `[attempt-id]` at the end of its document name) and
 records each status change in `result.history`. A successful `EndDoc` only
 means the spooler accepted the job. Tracking shows whether it actually printed.
+On Linux the CUPS job (its id from `lp`) is followed the same way, with pycups
+or, without it, `lpstat` (see [docs/print-server.md](docs/print-server.md#logs)).
 
 A **direct USB** job is always followed, whatever `track_timeout_s` is: the
 printer itself reports when it starts and finishes, so the outcome is never
@@ -395,6 +412,7 @@ elsewhere). Each application writes its **own** pair of files, named by the
 | shippy-gui | `printer-shippy-gui.log`, `printer-shippy-gui.jsonl` |
 | label watcher | `printer-watcher.log`, `printer-watcher.jsonl` |
 | `ibp-print-diag` | `printer-diag.log`, `printer-diag.jsonl` |
+| `ibp-print-server` | `printer-print-server.log`, `printer-print-server.jsonl` |
 | anything else (default) | `printer-ibp-printing.log`, `printer-ibp-printing.jsonl` |
 
 Separate files matter on Windows: a process cannot rotate a log file another
@@ -422,6 +440,15 @@ the host app's own log receives them too.
 ## Label watcher
 
 See [docs/watcher.md](docs/watcher.md).
+
+## Print server
+
+`ibp-print-server` runs on the intake stations (Linux): the IBP frontend posts
+each request label PNG to `http://localhost:40121/print-image` and the server
+prints it on the station's USB label printer through this library. Install it
+with `uv tool install "ibp-printing[linux] @ git+https://github.com/jonkensta/ibp-printing"`
+and run it from [`packaging/linux/ibp-print-server.service`](packaging/linux/ibp-print-server.service).
+HTTP contract, label sizing, setup and logs: [docs/print-server.md](docs/print-server.md).
 
 ## Development
 

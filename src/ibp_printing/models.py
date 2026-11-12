@@ -121,7 +121,7 @@ class PrinterCandidate:
     queue: PrintQueue
     vid_pid: Optional[str]
     usb_devices: tuple[UsbDevice, ...] = ()
-    # Platforms without USB matching (CUPS) treat every queue as usable.
+    # Backends without USB matching treat every queue as usable.
     usb_matching: bool = True
     # The USB device a direct candidate prints to (None for a queue).
     direct_device: Optional["DirectDevice"] = field(default=None, compare=False)

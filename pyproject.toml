@@ -1,6 +1,6 @@
 [project]
 name = "ibp-printing"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared USB label-printer discovery, printing, and diagnostics for IBP shipping tools"
 readme = "README.md"
 authors = [
@@ -25,6 +25,7 @@ watcher = [
 [project.scripts]
 ibp-print-diag = "ibp_printing.diagnostics:main"
 ibp-label-watcher = "ibp_printing.watcher.__main__:main"
+ibp-print-server = "ibp_printing.server:main"
 
 [project.gui-scripts]
 ibp-label-watcherw = "ibp_printing.watcher.__main__:main"

@@ -8,6 +8,7 @@ from ibp_printing.models import DeviceCaps
 from ibp_printing.render import (
     compute_draw_rect,
     describe_image,
+    fill_page,
     flatten_for_print,
     orient_portrait,
 )
@@ -151,6 +152,41 @@ class DescribeImageTests(unittest.TestCase):
             describe_image(img),
             {"size": [10, 20], "mode": "RGB", "format": None, "dpi": [300, 300]},
         )
+
+
+class FillPageTests(unittest.TestCase):
+    """fill_page: media orientation, aspect-kept scaling, exact sizes kept."""
+
+    def test_landscape_label_on_portrait_media_is_rotated_pixel_for_pixel(self):
+        img = Image.new("L", (1050, 420), 255)
+        img.putpixel((0, 0), 0)
+        page = fill_page(img, (420, 1050))
+        self.assertEqual(page.size, (420, 1050))
+        self.assertEqual(page.tobytes(), img.rotate(90, expand=True).tobytes())
+
+    def test_same_size_and_orientation_is_unchanged(self):
+        img = Image.new("L", (1050, 420), 0)
+        self.assertIs(fill_page(img, (1050, 420)), img)
+
+    def test_portrait_image_on_landscape_page_is_rotated(self):
+        page = fill_page(Image.new("L", (420, 1050), 0), (1050, 420))
+        self.assertEqual(page.size, (1050, 420))
+        self.assertEqual(page.getextrema(), (0, 0))
+
+    def test_aspect_is_kept_and_centered(self):
+        # 2:1 image on a 1050x420 (2.5:1) page: full height, white side bars.
+        page = fill_page(Image.new("L", (200, 100), 0), (1050, 420))
+        self.assertEqual(page.size, (1050, 420))
+        inverted = page.point(lambda v: 255 - v)
+        self.assertEqual(inverted.getbbox(), (105, 0, 945, 420))
+
+    def test_upscales_small_images(self):
+        page = fill_page(Image.new("L", (525, 210), 0), (1050, 420))
+        self.assertEqual(page.getextrema(), (0, 0))
+
+    def test_rejects_empty_page(self):
+        with self.assertRaises(ValueError):
+            fill_page(Image.new("L", (10, 10)), (0, 10))
 
 
 if __name__ == "__main__":
